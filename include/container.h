@@ -10,7 +10,11 @@ struct container {
     pid_t       pid;
 
     char private_dir[PATH_MAX];
-    int  private_dir_fd;
+    char overlay_upper[PATH_MAX];
+    char overlay_work[PATH_MAX];
+    char overlay_root[PATH_MAX];
+
+    int private_dir_fd;
 };
 
 int container_run(struct container *container);

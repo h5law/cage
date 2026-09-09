@@ -73,39 +73,62 @@ static int create_private_dir(struct container *container)
 
 static int create_overlay_dirs(struct container *container)
 {
-    char upper[PATH_MAX];
-    char work[PATH_MAX];
-    char root[PATH_MAX];
-
-    if (snprintf(upper, sizeof(upper), "%s/upper", container->private_dir) >=
-                ( int )sizeof(upper) ||
-        snprintf(work, sizeof(work), "%s/work", container->private_dir) >=
-                ( int )sizeof(work) ||
-        snprintf(root, sizeof(root), "%s/root", container->private_dir) >=
-                ( int )sizeof(root)) {
+    if (snprintf(container->overlay_upper, sizeof(container->overlay_upper),
+                 "%s/upper", container->private_dir) >=
+        ( int )sizeof(container->overlay_upper)) {
         errno = ENAMETOOLONG;
         return -1;
     }
 
-    if (mkdir(upper, 0700) == -1)
+    if (snprintf(container->overlay_work, sizeof(container->overlay_work),
+                 "%s/work", container->private_dir) >=
+        ( int )sizeof(container->overlay_work)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if (snprintf(container->overlay_root, sizeof(container->overlay_root),
+                 "%s/root", container->private_dir) >=
+        ( int )sizeof(container->overlay_root)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if (mkdir(container->overlay_upper, 0700) == -1)
         return -1;
 
-    if (mkdir(work, 0700) == -1) {
+    if (mkdir(container->overlay_work, 0700) == -1) {
         int saved_errno = errno;
-        rmdir(upper);
+
+        rmdir(container->overlay_upper);
         errno = saved_errno;
         return -1;
     }
 
-    if (mkdir(root, 0700) == -1) {
+    if (mkdir(container->overlay_root, 0700) == -1) {
         int saved_errno = errno;
-        rmdir(work);
-        rmdir(upper);
+
+        rmdir(container->overlay_work);
+        rmdir(container->overlay_upper);
         errno = saved_errno;
         return -1;
     }
 
     return 0;
+}
+
+static int mount_overlay(struct container *container)
+{
+    char options[PATH_MAX * 3];
+
+    if (snprintf(options, sizeof(options), "lowerdir=%s,upperdir=%s,workdir=%s",
+                 container->rootfs, container->overlay_upper,
+                 container->overlay_work) >= ( int )sizeof(options)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    return mount("overlay", container->overlay_root, "overlay", 0, options);
 }
 
 static void destroy_private_dir(struct container *container)
@@ -123,10 +146,8 @@ static void destroy_private_dir(struct container *container)
 }
 
 struct child_context {
-    const char *rootfs;
-    char      **argv;
-
-    int sync_fd;
+    struct container *container;
+    int               sync_fd;
 };
 
 static volatile sig_atomic_t command_pid   = -1;
@@ -514,7 +535,7 @@ static int run_command(struct child_context *ctx)
         if (unblock_forwarded_signals() == -1)
             _exit(127);
 
-        execvp(ctx->argv[0], ctx->argv);
+        execvp(ctx->container->argv[0], ctx->container->argv);
 
         perror("exec");
         _exit(127);
@@ -576,7 +597,7 @@ static int child_main(void *arg)
     if (make_mounts_private() == -1)
         return 1;
 
-    if (chroot(ctx->rootfs) == -1) {
+    if (chroot(ctx->container->rootfs) == -1) {
         perror("chroot");
         return 1;
     }
@@ -742,9 +763,8 @@ int container_run(struct container *container)
     }
 
     ctx = (struct child_context){
-            .rootfs  = container->rootfs,
-            .argv    = container->argv,
-            .sync_fd = sync_pipe[0],
+            .container = container,
+            .sync_fd   = sync_pipe[0],
     };
 
     stack_top      = stack + STACK_SIZE;

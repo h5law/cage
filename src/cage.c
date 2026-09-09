@@ -47,6 +47,9 @@ int main(int argc, char **argv)
             .argv           = &argv[2],
             .pid            = -1,
             .private_dir    = {0},
+            .overlay_upper  = {0},
+            .overlay_work   = {0},
+            .overlay_root   = {0},
             .private_dir_fd = -1,
     };
 
