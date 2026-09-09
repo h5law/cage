@@ -9,9 +9,11 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
-#define STACK_SIZE (1024 * 1024)
+#define STACK_SIZE           (1024 * 1024)
+#define TERMINATION_GRACE_MS 1000
 
 struct child_context {
     const char *rootfs;
@@ -120,6 +122,129 @@ static int wait_for_parent(struct child_context *ctx)
     return 0;
 }
 
+static int deadline_expired(const struct timespec *deadline)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
+        return 1;
+
+    if (now.tv_sec > deadline->tv_sec)
+        return 1;
+
+    if (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec)
+        return 1;
+
+    return 0;
+}
+
+static int terminate_descendants(void)
+{
+    struct timespec deadline;
+    int             remaining = 1;
+
+    /*
+     * Send SIGTERM to every process in this PID namespace except
+     * cage-init itself.
+     */
+    if (kill(-1, SIGTERM) == -1 && errno != ESRCH) {
+        perror("terminate descendants");
+        return -1;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) == -1) {
+        perror("clock_gettime");
+        return -1;
+    }
+
+    deadline.tv_nsec += TERMINATION_GRACE_MS * 1000000L;
+
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec  += deadline.tv_nsec / 1000000000L;
+        deadline.tv_nsec %= 1000000000L;
+    }
+
+    /*
+     * Reap children as they terminate. WNOHANG lets us check the
+     * deadline without blocking indefinitely on a process that
+     * refuses to exit.
+     */
+    while (!deadline_expired(&deadline)) {
+        int   status;
+        pid_t pid;
+
+        pid = waitpid(-1, &status, WNOHANG);
+
+        if (pid > 0) {
+            remaining = 0;
+            continue;
+        }
+
+        if (pid == -1) {
+            if (errno == EINTR)
+                continue;
+
+            if (errno == ECHILD)
+                return 0;
+
+            perror("waitpid");
+            return -1;
+        }
+
+        remaining = 1;
+
+        /*
+         * There is nothing to reap right now. Use a short
+         * monotonic-clock wait rather than an unbounded sleep.
+         */
+        {
+            struct timespec interval = {
+                    .tv_sec  = 0,
+                    .tv_nsec = 10000000L,
+            };
+
+            while (nanosleep(&interval, &interval) == -1) {
+                if (errno != EINTR)
+                    break;
+            }
+        }
+    }
+
+    /*
+     * Anything still alive after the grace period gets SIGKILL.
+     */
+    if (remaining) {
+        if (kill(-1, SIGKILL) == -1 && errno != ESRCH) {
+            perror("kill descendants");
+            return -1;
+        }
+    }
+
+    /*
+     * SIGKILL guarantees that remaining descendants will eventually
+     * terminate. Reap all of them before cage-init exits.
+     */
+    for (;;) {
+        int   status;
+        pid_t pid;
+
+        pid = waitpid(-1, &status, 0);
+
+        if (pid == -1) {
+            if (errno == EINTR)
+                continue;
+
+            if (errno == ECHILD)
+                break;
+
+            perror("waitpid");
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 static int run_command(struct child_context *ctx)
 {
     pid_t pid;
@@ -140,7 +265,7 @@ static int run_command(struct child_context *ctx)
     }
 
     /*
-     * PID 1 must reap every child it owns.  For now there is only
+     * PID 1 must reap every child it owns. For now there is only
      * the requested command, but this also gives us the correct
      * primitive for orphaned descendants.
      */
@@ -159,13 +284,24 @@ static int run_command(struct child_context *ctx)
         }
 
         if (waited == pid) {
+            int command_status;
+
             if (WIFEXITED(status))
-                return WEXITSTATUS(status);
+                command_status = WEXITSTATUS(status);
+            else if (WIFSIGNALED(status))
+                command_status = 128 + WTERMSIG(status);
+            else
+                command_status = 1;
 
-            if (WIFSIGNALED(status))
-                return 128 + WTERMSIG(status);
+            /*
+             * The requested command has exited. Any remaining
+             * processes are descendants that must not survive
+             * container teardown.
+             */
+            if (terminate_descendants() == -1)
+                return 1;
 
-            return 1;
+            return command_status;
         }
     }
 
@@ -193,10 +329,8 @@ static int child_main(void *arg)
         return 1;
     }
 
-    if (chdir("/") == -1) {
-        perror("chdir");
+    if (chdir("/") == -1)
         return 1;
-    }
 
     /*
      * We are PID 1 inside the new PID namespace.
