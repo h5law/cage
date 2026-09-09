@@ -1,11 +1,14 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/magic.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -83,10 +86,7 @@ static int run_signal(void)
         pause();
 }
 
-static int check_pid_namespace(void)
-{
-    return getppid() == 1 ? 0 : 1;
-}
+static int check_pid_namespace(void) { return getppid() == 1 ? 0 : 1; }
 
 static int check_user_namespace(void)
 {
@@ -99,6 +99,84 @@ static int check_mount_namespace(void)
         return 1;
 
     if (mount("tmpfs", "/mnt", "tmpfs", 0, NULL) == -1)
+        return 1;
+
+    return 0;
+}
+
+static int check_tmpfs(void)
+{
+    struct statfs fs;
+    int           fd;
+
+    if (statfs("/tmp", &fs) == -1)
+        return 1;
+
+    if (fs.f_type != TMPFS_MAGIC)
+        return 1;
+
+    fd = open("/tmp/cage-tmpfs-test", O_CREAT | O_WRONLY, 0600);
+
+    if (fd == -1)
+        return 1;
+
+    close(fd);
+
+    if (unlink("/tmp/cage-tmpfs-test") == -1)
+        return 1;
+
+    return 0;
+}
+
+static int check_proc(void)
+{
+    struct statfs fs;
+
+    if (statfs("/proc", &fs) == -1)
+        return 1;
+
+    if (fs.f_type != PROC_SUPER_MAGIC)
+        return 1;
+
+    return 0;
+}
+
+static int check_dev(void)
+{
+    struct statfs fs;
+    struct stat   st;
+
+    if (statfs("/dev", &fs) == -1)
+        return 1;
+
+    if (fs.f_type != TMPFS_MAGIC)
+        return 1;
+
+    if (stat("/dev/null", &st) == -1)
+        return 1;
+
+    if (!S_ISCHR(st.st_mode))
+        return 1;
+
+    if (major(st.st_rdev) != 1 || minor(st.st_rdev) != 3)
+        return 1;
+
+    if (stat("/dev/zero", &st) == -1)
+        return 1;
+
+    if (!S_ISCHR(st.st_mode))
+        return 1;
+
+    if (major(st.st_rdev) != 1 || minor(st.st_rdev) != 5)
+        return 1;
+
+    if (stat("/dev/urandom", &st) == -1)
+        return 1;
+
+    if (!S_ISCHR(st.st_mode))
+        return 1;
+
+    if (major(st.st_rdev) != 1 || minor(st.st_rdev) != 9)
         return 1;
 
     return 0;
@@ -213,6 +291,27 @@ int main(int argc, char **argv)
             return 2;
 
         return check_mount_namespace();
+    }
+
+    if (strcmp(argv[1], "tmpfs") == 0) {
+        if (argc != 2)
+            return 2;
+
+        return check_tmpfs();
+    }
+
+    if (strcmp(argv[1], "proc") == 0) {
+        if (argc != 2)
+            return 2;
+
+        return check_proc();
+    }
+
+    if (strcmp(argv[1], "dev") == 0) {
+        if (argc != 2)
+            return 2;
+
+        return check_dev();
     }
 
     if (strcmp(argv[1], "uncooperative-orphan") == 0) {

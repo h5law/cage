@@ -774,6 +774,81 @@ static void test_user_namespace_mapping(const char *cage, const char *rootfs)
               "failed to inspect UID/GID maps");
 }
 
+static void test_tmpfs_mount(const char *cage, const char *rootfs)
+{
+    char *argv[] = {
+            "/tests/container_probe",
+            "tmpfs",
+            NULL,
+    };
+    int status;
+
+    status = run_cage(cage, rootfs, argv);
+
+    if (status == 0) {
+        test_pass("/tmp is a private writable tmpfs");
+        return;
+    }
+
+    {
+        char reason[64];
+
+        snprintf(reason, sizeof(reason), "expected 0, got %d", status);
+
+        test_fail("/tmp is a private writable tmpfs", reason);
+    }
+}
+
+static void test_proc_mount(const char *cage, const char *rootfs)
+{
+    char *argv[] = {
+            "/tests/container_probe",
+            "proc",
+            NULL,
+    };
+    int status;
+
+    status = run_cage(cage, rootfs, argv);
+
+    if (status == 0) {
+        test_pass("/proc is a proc filesystem");
+        return;
+    }
+
+    {
+        char reason[64];
+
+        snprintf(reason, sizeof(reason), "expected 0, got %d", status);
+
+        test_fail("/proc is a proc filesystem", reason);
+    }
+}
+
+static void test_dev_mount(const char *cage, const char *rootfs)
+{
+    char *argv[] = {
+            "/tests/container_probe",
+            "dev",
+            NULL,
+    };
+    int status;
+
+    status = run_cage(cage, rootfs, argv);
+
+    if (status == 0) {
+        test_pass("/dev is a private tmpfs with device nodes");
+        return;
+    }
+
+    {
+        char reason[64];
+
+        snprintf(reason, sizeof(reason), "expected 0, got %d", status);
+
+        test_fail("/dev is a private tmpfs with device nodes", reason);
+    }
+}
+
 static void test_mount_namespace(const char *cage, const char *rootfs)
 {
     char  mount_path[PATH_MAX];
@@ -1010,6 +1085,9 @@ int main(int argc, char **argv)
     test_user_namespace(argv[1], rootfs);
     test_user_namespace_mapping(argv[1], rootfs);
     test_mount_namespace(argv[1], rootfs);
+    test_tmpfs_mount(argv[1], rootfs);
+    test_proc_mount(argv[1], rootfs);
+    test_dev_mount(argv[1], rootfs);
     test_network_namespace(argv[1], rootfs);
     test_ipc_namespace(argv[1], rootfs);
     test_exec_failure(argv[1], rootfs);

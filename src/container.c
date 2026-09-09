@@ -12,6 +12,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -104,13 +105,8 @@ static int create_overlay_dirs(struct container *container)
     if (mkdir(container->overlay_root, 0700) == -1)
         goto fail_work;
 
-    if (mkdir(container->overlay_old_root, 0700) == -1)
-        goto fail_root;
-
     return 0;
 
-fail_root:
-    rmdir(container->overlay_root);
 fail_work:
     rmdir(container->overlay_work);
 fail_upper:
@@ -141,15 +137,7 @@ static int mount_overlay(struct container *container)
 
 static int prepare_old_root(struct container *container)
 {
-    char old_root[PATH_MAX];
-
-    if (snprintf(old_root, sizeof(old_root), "%s/oldroot",
-                 container->overlay_root) >= ( int )sizeof(old_root)) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-
-    if (mkdir(old_root, 0700) == -1)
+    if (mkdir(container->overlay_old_root, 0700) == -1)
         return -1;
 
     return 0;
@@ -157,14 +145,6 @@ static int prepare_old_root(struct container *container)
 
 static int pivot_root_to_overlay(struct container *container)
 {
-    char old_root[PATH_MAX];
-
-    if (snprintf(old_root, sizeof(old_root), "%s/oldroot",
-                 container->overlay_root) >= ( int )sizeof(old_root)) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-
     if (chdir(container->overlay_root) == -1)
         return -1;
 
@@ -178,6 +158,106 @@ static int pivot_root_to_overlay(struct container *container)
         return -1;
 
     if (rmdir("/oldroot") == -1)
+        return -1;
+
+    return 0;
+}
+
+static int mount_tmpfs(void)
+{
+    if (mkdir("/tmp", 01777) == -1 && errno != EEXIST)
+        return -1;
+
+    if (mount("tmpfs", "/tmp", "tmpfs", 0, NULL) == -1)
+        return -1;
+
+    return 0;
+}
+
+static int mount_dev(struct container *container)
+{
+    char dev_path[PATH_MAX];
+
+    if (snprintf(dev_path, sizeof(dev_path), "%s/dev",
+                 container->overlay_root) >= ( int )sizeof(dev_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if (mkdir(dev_path, 0755) == -1 && errno != EEXIST)
+        return -1;
+
+    if (mount("tmpfs", dev_path, "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=0755") ==
+        -1)
+        return -1;
+
+    return 0;
+}
+
+static int bind_device(struct container *container, const char *source,
+                       const char *name)
+{
+    char target[PATH_MAX];
+    int  fd;
+
+    if (snprintf(target, sizeof(target), "%s/dev/%s", container->overlay_root,
+                 name) >= ( int )sizeof(target)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    fd = open(target, O_CREAT | O_RDWR | O_CLOEXEC, 0666);
+    if (fd == -1)
+        return -1;
+
+    if (close(fd) == -1)
+        return -1;
+
+    if (mount(source, target, NULL, MS_BIND, NULL) == -1)
+        return -1;
+
+    return 0;
+}
+
+static int setup_dev(struct container *container)
+{
+    struct {
+        const char *source;
+        const char *name;
+    } devices[] = {
+            {"/dev/null",    "null"   },
+            {"/dev/zero",    "zero"   },
+            {"/dev/random",  "random" },
+            {"/dev/urandom", "urandom"},
+            {"/dev/tty",     "tty"    },
+    };
+
+    if (mount_dev(container) == -1)
+        return -1;
+
+    for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
+        if (bind_device(container, devices[i].source, devices[i].name) == -1)
+            return -1;
+    }
+
+    return 0;
+}
+
+static int mount_proc(struct container *container)
+{
+    char proc_path[PATH_MAX];
+
+    if (snprintf(proc_path, sizeof(proc_path), "%s/proc",
+                 container->overlay_root) >= ( int )sizeof(proc_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if (mkdir(proc_path, 0555) == -1 && errno != EEXIST)
+        return -1;
+
+    if (mount("proc", proc_path, "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV,
+              "subset=pid") == -1)
         return -1;
 
     return 0;
@@ -654,6 +734,16 @@ static int child_main(void *arg)
         return 1;
     }
 
+    if (mount_proc(ctx->container) == -1) {
+        perror("mount proc");
+        return 1;
+    }
+
+    if (setup_dev(ctx->container) == -1) {
+        perror("mount and setup /dev");
+        return 1;
+    }
+
     if (prepare_old_root(ctx->container) == -1) {
         perror("prepare old root");
         return 1;
@@ -661,6 +751,11 @@ static int child_main(void *arg)
 
     if (pivot_root_to_overlay(ctx->container) == -1) {
         perror("pivot root");
+        return 1;
+    }
+
+    if (mount_tmpfs() == -1) {
+        perror("mount tmpfs");
         return 1;
     }
 
