@@ -2,18 +2,88 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define STACK_SIZE           (1024 * 1024)
 #define TERMINATION_GRACE_MS 1000
+
+#ifndef CAGE_RUNTIME_DIR
+#define CAGE_RUNTIME_DIR "/tmp"
+#endif
+
+static int create_private_dir(struct container *container)
+{
+    char template[PATH_MAX];
+
+    if (snprintf(template, sizeof(template), "%s/cage-XXXXXX",
+                 CAGE_RUNTIME_DIR) >= ( int )sizeof(template)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if (mkdtemp(template) == NULL)
+        return -1;
+
+    if (snprintf(container->private_dir, sizeof(container->private_dir), "%s",
+                 template) >= ( int )sizeof(container->private_dir)) {
+        rmdir(template);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    container->private_dir_fd =
+            open(container->private_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+    if (container->private_dir_fd == -1) {
+        int saved_errno = errno;
+
+        rmdir(container->private_dir);
+        container->private_dir[0] = '\0';
+
+        errno                     = saved_errno;
+        return -1;
+    }
+
+    if (flock(container->private_dir_fd, LOCK_EX | LOCK_NB) == -1) {
+        int saved_errno = errno;
+
+        close(container->private_dir_fd);
+        rmdir(container->private_dir);
+
+        container->private_dir_fd = -1;
+        container->private_dir[0] = '\0';
+
+        errno                     = saved_errno;
+        return -1;
+    }
+
+    return 0;
+}
+
+static void destroy_private_dir(struct container *container)
+{
+    if (container->private_dir_fd != -1) {
+        flock(container->private_dir_fd, LOCK_UN);
+        close(container->private_dir_fd);
+        container->private_dir_fd = -1;
+    }
+
+    if (container->private_dir[0] != '\0') {
+        rmdir(container->private_dir);
+        container->private_dir[0] = '\0';
+    }
+}
 
 struct child_context {
     const char *rootfs;
@@ -599,13 +669,20 @@ int container_run(struct container *container)
     command_pid    = -1;
     container_pid  = -1;
 
+    if (create_private_dir(container) == -1) {
+        perror("create private directory");
+        return -1;
+    }
+
     if (block_forwarded_signals(&old_mask) == -1) {
         perror("sigprocmask");
+        destroy_private_dir(container);
         return -1;
     }
 
     if (pipe2(sync_pipe, O_CLOEXEC) == -1) {
         perror("pipe2");
+        destroy_private_dir(container);
         ( void )restore_signal_mask(&old_mask);
         return -1;
     }
@@ -616,6 +693,7 @@ int container_run(struct container *container)
         perror("malloc");
         close(sync_pipe[0]);
         close(sync_pipe[1]);
+        destroy_private_dir(container);
         ( void )restore_signal_mask(&old_mask);
         return -1;
     }
@@ -639,6 +717,7 @@ int container_run(struct container *container)
         perror("clone");
         free(stack);
         close(sync_pipe[1]);
+        destroy_private_dir(container);
         ( void )restore_signal_mask(&old_mask);
         return -1;
     }
@@ -653,6 +732,7 @@ int container_run(struct container *container)
         perror("install signal handlers");
         kill_and_reap_container(container->pid);
         close(sync_pipe[1]);
+        destroy_private_dir(container);
         container_pid  = -1;
         container->pid = -1;
         free(stack);
@@ -665,6 +745,7 @@ int container_run(struct container *container)
     if (configure_user_namespace(container->pid) == -1) {
         kill_and_reap_container(container->pid);
         close(sync_pipe[1]);
+        destroy_private_dir(container);
         container_pid  = -1;
         container->pid = -1;
         reset_container_signal_handlers();
@@ -682,6 +763,8 @@ int container_run(struct container *container)
 
         kill_and_reap_container(container->pid);
         close(sync_pipe[1]);
+
+        destroy_private_dir(container);
 
         container_pid  = -1;
         container->pid = -1;
@@ -702,6 +785,8 @@ int container_run(struct container *container)
         perror("close sync pipe");
 
         kill_and_reap_container(container->pid);
+
+        destroy_private_dir(container);
 
         container_pid  = -1;
         container->pid = -1;
@@ -724,6 +809,7 @@ int container_run(struct container *container)
         perror("sigprocmask");
 
         kill_and_reap_container(container->pid);
+        destroy_private_dir(container);
 
         container_pid  = -1;
         container->pid = -1;
@@ -748,6 +834,7 @@ int container_run(struct container *container)
         perror("waitpid");
 
         kill_and_reap_container(container->pid);
+        destroy_private_dir(container);
 
         container_pid  = -1;
         container->pid = -1;
@@ -758,6 +845,8 @@ int container_run(struct container *container)
         free(stack);
         return -1;
     }
+
+    destroy_private_dir(container);
 
     container_pid  = -1;
     container->pid = -1;
