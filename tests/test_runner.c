@@ -851,61 +851,55 @@ static void test_dev_mount(const char *cage, const char *rootfs)
 
 static void test_mount_namespace(const char *cage, const char *rootfs)
 {
-    char  mount_path[PATH_MAX];
     char *argv[] = {
             "/tests/container_probe",
-            "mount",
+            "signal",
             NULL,
     };
-    struct stat st;
-    int         status;
+    pid_t cage_pid;
+    pid_t container_pid;
+    int   ready_fd;
+    int   isolated;
+    int   status;
 
-    if (snprintf(mount_path, sizeof(mount_path), "%s/mnt", rootfs) >=
-        ( int )sizeof(mount_path)) {
-        test_fail("mount namespace isolates mounts", "mount path is too long");
-        return;
-    }
-
-    if (mkdir(mount_path, 0755) == -1) {
+    if (start_cage(cage, rootfs, argv, &cage_pid, &ready_fd) == -1) {
         test_fail("mount namespace isolates mounts", strerror(errno));
         return;
     }
 
-    status = run_cage(cage, rootfs, argv);
-
-    if (status != 0) {
-        rmdir(mount_path);
-
-        {
-            char reason[64];
-
-            snprintf(reason, sizeof(reason), "mount probe exited with %d",
-                     status);
-
-            test_fail("mount namespace isolates mounts", reason);
-        }
-
-        return;
-    }
-
-    if (stat(mount_path, &st) == -1) {
-        test_fail("mount namespace isolates mounts", strerror(errno));
-        return;
-    }
-
-    if (!S_ISDIR(st.st_mode)) {
+    if (wait_for_cage_ready(cage_pid, ready_fd) == -1) {
         test_fail("mount namespace isolates mounts",
-                  "host mountpoint is no longer a directory");
+                  "workload did not become ready");
         return;
     }
 
-    if (rmdir(mount_path) == -1) {
+    if (find_container_pid(cage_pid, &container_pid) == -1) {
+        kill(cage_pid, SIGKILL);
+        waitpid(cage_pid, NULL, 0);
+
         test_fail("mount namespace isolates mounts",
-                  "failed to remove host mountpoint");
+                  "could not find container init");
         return;
     }
 
-    test_pass("mount namespace isolates mounts");
+    isolated = namespace_differs(container_pid, "mnt");
+
+    kill(cage_pid, SIGTERM);
+    waitpid(cage_pid, &status, 0);
+
+    if (isolated == 1) {
+        test_pass("mount namespace isolates mounts");
+        return;
+    }
+
+    if (isolated == 0) {
+        test_fail("mount namespace isolates mounts",
+                  "container shares the host mount namespace");
+        return;
+    }
+
+    test_fail("mount namespace isolates mounts",
+              "failed to inspect mount namespace");
 }
 
 static void test_ipc_namespace(const char *cage, const char *rootfs)
@@ -1019,6 +1013,56 @@ static void test_descendant_force_cleanup(const char *cage, const char *rootfs)
     }
 }
 
+static void test_capabilities(const char *cage, const char *rootfs)
+{
+    char *argv[] = {
+            "/tests/container_probe",
+            "capabilities",
+            NULL,
+    };
+    int status;
+
+    status = run_cage(cage, rootfs, argv);
+
+    if (status == 0) {
+        test_pass("capabilities are dropped");
+        return;
+    }
+
+    {
+        char reason[64];
+
+        snprintf(reason, sizeof(reason), "expected 0, got %d", status);
+
+        test_fail("capabilities are dropped", reason);
+    }
+}
+
+static void test_no_new_privs(const char *cage, const char *rootfs)
+{
+    char *argv[] = {
+            "/tests/container_probe",
+            "no-new-privs",
+            NULL,
+    };
+    int status;
+
+    status = run_cage(cage, rootfs, argv);
+
+    if (status == 0) {
+        test_pass("no_new_privs is enabled");
+        return;
+    }
+
+    {
+        char reason[64];
+
+        snprintf(reason, sizeof(reason), "expected 0, got %d", status);
+
+        test_fail("no_new_privs is enabled", reason);
+    }
+}
+
 static void test_invalid_rootfs(const char *cage)
 {
     char *argv[] = {
@@ -1063,6 +1107,119 @@ static void test_exec_failure(const char *cage, const char *rootfs)
     }
 }
 
+static int process_exists(pid_t pid)
+{
+    char path[PATH_MAX];
+
+    if (snprintf(path, sizeof(path), "/proc/%ld", ( long )pid) >=
+        ( int )sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if (access(path, F_OK) == 0)
+        return 1;
+
+    if (errno == ENOENT)
+        return 0;
+
+    return -1;
+}
+
+static void test_parent_death(const char *cage, const char *rootfs)
+{
+    char *argv[] = {
+            "/tests/container_probe",
+            "signal",
+            NULL,
+    };
+    pid_t cage_pid;
+    pid_t container_pid;
+    int   ready_fd;
+    int   status;
+    int   result;
+
+    if (start_cage(cage, rootfs, argv, &cage_pid, &ready_fd) == -1) {
+        test_fail("container dies when cage supervisor dies", strerror(errno));
+        return;
+    }
+
+    if (wait_for_cage_ready(cage_pid, ready_fd) == -1) {
+        test_fail("container dies when cage supervisor dies",
+                  "workload did not become ready");
+        return;
+    }
+
+    if (find_container_pid(cage_pid, &container_pid) == -1) {
+        kill(cage_pid, SIGKILL);
+        waitpid(cage_pid, NULL, 0);
+
+        test_fail("container dies when cage supervisor dies",
+                  "could not find container init");
+        return;
+    }
+
+    /*
+     * Kill the cage supervisor without allowing normal container
+     * teardown to run. The container should receive SIGKILL through
+     * PR_SET_PDEATHSIG.
+     */
+    if (kill(cage_pid, SIGKILL) == -1) {
+        test_fail("container dies when cage supervisor dies", strerror(errno));
+        return;
+    }
+
+    if (waitpid(cage_pid, &status, 0) == -1) {
+        test_fail("container dies when cage supervisor dies", strerror(errno));
+        return;
+    }
+
+    /*
+     * Wait briefly for the parent-death signal to terminate the
+     * container process and for /proc to reflect its disappearance.
+     */
+    result = 0;
+
+    for (int attempt = 0; attempt < 20; attempt++) {
+        result = process_exists(container_pid);
+
+        if (result == 0)
+            break;
+
+        if (result == -1)
+            break;
+
+        usleep(10000);
+    }
+
+    if (result == 0) {
+        test_pass("container dies when cage supervisor dies");
+        return;
+    }
+
+    if (result == -1) {
+        test_fail("container dies when cage supervisor dies",
+                  "failed to inspect container process");
+        return;
+    }
+
+    /*
+     * Clean up if parent-death handling failed, so a failed test
+     * does not leave a container behind.
+     */
+    kill(container_pid, SIGKILL);
+
+    {
+        char reason[64];
+
+        snprintf(reason, sizeof(reason),
+                 "container PID %ld survived supervisor death",
+                 ( long )container_pid);
+
+        test_fail("container dies when cage supervisor dies", reason);
+    }
+}
+
 int main(int argc, char **argv)
 {
     char rootfs[PATH_MAX];
@@ -1090,8 +1247,11 @@ int main(int argc, char **argv)
     test_dev_mount(argv[1], rootfs);
     test_network_namespace(argv[1], rootfs);
     test_ipc_namespace(argv[1], rootfs);
+    test_capabilities(argv[1], rootfs);
+    test_no_new_privs(argv[1], rootfs);
     test_exec_failure(argv[1], rootfs);
     test_invalid_rootfs(argv[1]);
+    test_parent_death(argv[1], rootfs);
 
     remove_rootfs(rootfs);
 

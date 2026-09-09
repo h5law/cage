@@ -1,16 +1,19 @@
 #include "container.h"
 
-#include <errno.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/capability.h>
+#include <poll.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mount.h>
 #include <sys/file.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
@@ -110,6 +113,7 @@ static int create_overlay_dirs(struct container *container)
 
 fail_work:
     rmdir(container->overlay_work);
+
 fail_upper:
     rmdir(container->overlay_upper);
     return -1;
@@ -208,6 +212,7 @@ static int bind_device(struct container *container, const char *source,
     }
 
     fd = open(target, O_CREAT | O_RDWR | O_CLOEXEC, 0666);
+
     if (fd == -1)
         return -1;
 
@@ -222,7 +227,7 @@ static int bind_device(struct container *container, const char *source,
 
 static int setup_dev(struct container *container)
 {
-    struct {
+    static const struct {
         const char *source;
         const char *name;
     } devices[] = {
@@ -332,6 +337,7 @@ static int remove_tree(const char *path)
     char           child[PATH_MAX];
 
     dir = opendir(path);
+
     if (dir == NULL) {
         if (errno == ENOENT)
             return 0;
@@ -396,11 +402,110 @@ static void destroy_private_dir(struct container *container)
     }
 }
 
+static int drop_capabilities(void)
+{
+    struct __user_cap_header_struct header;
+    struct __user_cap_data_struct   data[2];
+
+    /*
+     * CAP_SETPCAP is required to modify the capability bounding set.
+     * Drop every other capability from the bounding set first.
+     */
+    for (int capability = 0; capability <= CAP_LAST_CAP; capability++) {
+        if (capability == CAP_SETPCAP)
+            continue;
+
+        if (prctl(PR_CAPBSET_DROP, capability, 0, 0, 0) == -1 &&
+            errno != EINVAL)
+            return -1;
+    }
+
+    /*
+     * Drop CAP_SETPCAP from the bounding set last.
+     */
+    if (prctl(PR_CAPBSET_DROP, CAP_SETPCAP, 0, 0, 0) == -1 && errno != EINVAL)
+        return -1;
+
+    /*
+     * Now clear the effective, permitted and inheritable sets.
+     */
+    memset(&header, 0, sizeof(header));
+    memset(data, 0, sizeof(data));
+
+    header.version = _LINUX_CAPABILITY_VERSION_3;
+    header.pid     = 0;
+
+    if (syscall(SYS_capset, &header, data) == -1)
+        return -1;
+
+    return 0;
+}
+
+static int set_no_new_privs(void)
+{
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1)
+        return -1;
+
+    return 0;
+}
+
+static int open_pidfd(pid_t pid)
+{
+    return ( int )syscall(SYS_pidfd_open, pid, 0);
+}
+
+static int parent_is_alive(int parent_fd)
+{
+    struct pollfd pfd;
+    int           result;
+
+    pfd = (struct pollfd){
+            .fd      = parent_fd,
+            .events  = POLLIN,
+            .revents = 0,
+    };
+
+    do {
+        result = poll(&pfd, 1, 0);
+    } while (result == -1 && errno == EINTR);
+
+    if (result == -1)
+        return -1;
+
+    return result == 0;
+}
+
+static int set_parent_death_signal(void)
+{
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) == -1)
+        return -1;
+
+    return 0;
+}
+
 struct child_context {
     struct container *container;
     int               sync_fd;
+    int               parent_fd;
     int               work_fd;
 };
+
+static int verify_parent_alive(struct child_context *ctx)
+{
+    int alive;
+
+    alive = parent_is_alive(ctx->parent_fd);
+
+    if (alive == -1)
+        return -1;
+
+    if (!alive) {
+        errno = ECANCELED;
+        return -1;
+    }
+
+    return 0;
+}
 
 static volatile sig_atomic_t command_pid   = -1;
 static volatile sig_atomic_t container_pid = -1;
@@ -784,6 +889,12 @@ static int run_command(struct child_context *ctx)
     if (pid == 0) {
         reset_signal_handlers();
 
+        if (drop_capabilities() == -1)
+            _exit(127);
+
+        if (set_no_new_privs() == -1)
+            _exit(127);
+
         if (unblock_forwarded_signals() == -1)
             _exit(127);
 
@@ -845,6 +956,28 @@ static int child_main(void *arg)
         perror("wait for namespace setup");
         return 1;
     }
+
+    /*
+     * Install the kernel-enforced parent-death signal first.
+     *
+     * The pidfd check immediately afterwards closes the race window
+     * between clone() and PR_SET_PDEATHSIG: if the supervisor died
+     * before PDEATHSIG was installed, the pidfd is already readable.
+     */
+    if (set_parent_death_signal() == -1)
+        _exit(127);
+
+    if (verify_parent_alive(ctx) == -1)
+        _exit(127);
+
+    /*
+     * The pidfd has served its purpose for the race check. PDEATHSIG
+     * now provides the ongoing parent-death guarantee.
+     */
+    if (close(ctx->parent_fd) == -1)
+        _exit(127);
+
+    ctx->parent_fd = -1;
 
     if (make_mounts_private() == -1)
         return 1;
@@ -1006,6 +1139,7 @@ int container_run(struct container *container)
     char                *stack;
     char                *stack_top;
     int                  sync_pipe[2];
+    int                  parent_fd;
     int                  status;
     char                 ready;
     int                  handlers_installed;
@@ -1058,9 +1192,27 @@ int container_run(struct container *container)
     ctx = (struct child_context){
             .container = container,
             .sync_fd   = sync_pipe[0],
+            .parent_fd = -1,
             .work_fd   = -1,
     };
 
+    /*
+     * Open the pidfd before clone(). This gives the child a stable,
+     * namespace-independent reference to the cage supervisor.
+     */
+    parent_fd = open_pidfd(getpid());
+
+    if (parent_fd == -1) {
+        perror("pidfd_open");
+        free(stack);
+        close(sync_pipe[0]);
+        close(sync_pipe[1]);
+        destroy_private_dir(container);
+        ( void )restore_signal_mask(&old_mask);
+        return -1;
+    }
+
+    ctx.parent_fd  = parent_fd;
     stack_top      = stack + STACK_SIZE;
 
     container->pid = clone(child_main, stack_top,
@@ -1068,7 +1220,12 @@ int container_run(struct container *container)
                                    CLONE_NEWNET | CLONE_NEWIPC | SIGCHLD,
                            &ctx);
 
+    /*
+     * The parent no longer needs either of these descriptors.
+     * The child retains its inherited copies.
+     */
     close(sync_pipe[0]);
+    close(parent_fd);
 
     if (container->pid == -1) {
         perror("clone");
