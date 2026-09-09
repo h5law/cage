@@ -22,6 +22,68 @@ struct child_context {
     int sync_fd;
 };
 
+static volatile sig_atomic_t command_pid = -1;
+
+static void forward_signal(int signal)
+{
+    pid_t pid = ( pid_t )command_pid;
+
+    if (pid > 0)
+        kill(pid, signal);
+}
+
+static int install_signal_handlers(void)
+{
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+
+    action.sa_handler = forward_signal;
+
+    if (sigemptyset(&action.sa_mask) == -1)
+        return -1;
+
+    if (sigaction(SIGTERM, &action, NULL) == -1)
+        return -1;
+
+    if (sigaction(SIGINT, &action, NULL) == -1)
+        return -1;
+
+    if (sigaction(SIGHUP, &action, NULL) == -1)
+        return -1;
+
+    if (sigaction(SIGQUIT, &action, NULL) == -1)
+        return -1;
+
+    return 0;
+}
+
+static int reset_signal_handlers(void)
+{
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+
+    action.sa_handler = SIG_DFL;
+
+    if (sigemptyset(&action.sa_mask) == -1)
+        return -1;
+
+    if (sigaction(SIGTERM, &action, NULL) == -1)
+        return -1;
+
+    if (sigaction(SIGINT, &action, NULL) == -1)
+        return -1;
+
+    if (sigaction(SIGHUP, &action, NULL) == -1)
+        return -1;
+
+    if (sigaction(SIGQUIT, &action, NULL) == -1)
+        return -1;
+
+    return 0;
+}
+
 static int write_file(const char *path, const char *value)
 {
     int     fd;
@@ -193,10 +255,6 @@ static int terminate_descendants(void)
 
         remaining = 1;
 
-        /*
-         * There is nothing to reap right now. Use a short
-         * monotonic-clock wait rather than an unbounded sleep.
-         */
         {
             struct timespec interval = {
                     .tv_sec  = 0,
@@ -249,6 +307,12 @@ static int run_command(struct child_context *ctx)
 {
     pid_t pid;
     int   status;
+    int   command_status;
+
+    if (install_signal_handlers() == -1) {
+        perror("install signal handlers");
+        return 1;
+    }
 
     pid = fork();
 
@@ -258,11 +322,22 @@ static int run_command(struct child_context *ctx)
     }
 
     if (pid == 0) {
+        /*
+         * The workload must not inherit cage-init's signal
+         * forwarding handlers.
+         */
+        if (reset_signal_handlers() == -1) {
+            perror("reset signal handlers");
+            _exit(127);
+        }
+
         execvp(ctx->argv[0], ctx->argv);
 
         perror("exec");
         _exit(127);
     }
+
+    command_pid = pid;
 
     /*
      * PID 1 must reap every child it owns. For now there is only
@@ -280,18 +355,19 @@ static int run_command(struct child_context *ctx)
                 break;
 
             perror("waitpid");
+            command_pid = -1;
             return 1;
         }
 
         if (waited == pid) {
-            int command_status;
-
             if (WIFEXITED(status))
                 command_status = WEXITSTATUS(status);
             else if (WIFSIGNALED(status))
                 command_status = 128 + WTERMSIG(status);
             else
                 command_status = 1;
+
+            command_pid = -1;
 
             /*
              * The requested command has exited. Any remaining
@@ -304,6 +380,8 @@ static int run_command(struct child_context *ctx)
             return command_status;
         }
     }
+
+    command_pid = -1;
 
     return 1;
 }
