@@ -43,14 +43,15 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
 
     container = (struct container){
-            .rootfs         = argv[1],
-            .argv           = &argv[2],
-            .pid            = -1,
-            .private_dir    = {0},
-            .overlay_upper  = {0},
-            .overlay_work   = {0},
-            .overlay_root   = {0},
-            .private_dir_fd = -1,
+            .rootfs           = argv[1],
+            .argv             = &argv[2],
+            .pid              = -1,
+            .private_dir      = {0},
+            .overlay_upper    = {0},
+            .overlay_work     = {0},
+            .overlay_root     = {0},
+            .overlay_old_root = {0},
+            .private_dir_fd   = -1,
     };
 
     status = container_run(&container);

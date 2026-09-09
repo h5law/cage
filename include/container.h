@@ -13,6 +13,7 @@ struct container {
     char overlay_upper[PATH_MAX];
     char overlay_work[PATH_MAX];
     char overlay_root[PATH_MAX];
+    char overlay_old_root[PATH_MAX];
 
     int private_dir_fd;
 };

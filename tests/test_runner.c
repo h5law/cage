@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -185,16 +186,6 @@ static void remove_rootfs(const char *rootfs)
         unlink(path);
     }
 
-    if (snprintf(path, sizeof(path), "%s/tests/signal.ready", rootfs) <
-        ( int )sizeof(path)) {
-        unlink(path);
-    }
-
-    if (snprintf(path, sizeof(path), "%s/tests/orphan.lock", rootfs) <
-        ( int )sizeof(path)) {
-        unlink(path);
-    }
-
     if (snprintf(path, sizeof(path), "%s/tests", rootfs) <
         ( int )sizeof(path)) {
         rmdir(path);
@@ -203,26 +194,130 @@ static void remove_rootfs(const char *rootfs)
     rmdir(rootfs);
 }
 
-static int wait_for_file(const char *path)
+static int wait_for_ready(int fd)
 {
-    struct timespec interval = {
-            .tv_sec  = 0,
-            .tv_nsec = 10000000L,
+    struct pollfd pfd = {
+            .fd     = fd,
+            .events = POLLIN,
     };
-    struct stat st;
-    int         attempts = 500;
+    char   buffer[sizeof("ready\n") - 1];
+    size_t offset = 0;
 
-    while (attempts-- > 0) {
-        if (stat(path, &st) == 0)
-            return 0;
+    while (offset < sizeof(buffer)) {
+        int     result;
+        ssize_t count;
 
-        if (errno != ENOENT)
+        do {
+            result = poll(&pfd, 1, 5000);
+        } while (result == -1 && errno == EINTR);
+
+        if (result == -1)
             return -1;
 
-        while (nanosleep(&interval, NULL) == -1) {
-            if (errno != EINTR)
-                return -1;
+        if (result == 0) {
+            errno = ETIMEDOUT;
+            return -1;
         }
+
+        if (pfd.revents & (POLLERR | POLLNVAL)) {
+            errno = EIO;
+            return -1;
+        }
+
+        count = read(fd, buffer + offset, sizeof(buffer) - offset);
+
+        if (count == -1) {
+            if (errno == EINTR)
+                continue;
+
+            return -1;
+        }
+
+        if (count == 0) {
+            errno = EPIPE;
+            return -1;
+        }
+
+        offset += ( size_t )count;
+    }
+
+    if (memcmp(buffer, "ready\n", sizeof(buffer)) != 0) {
+        errno = EPROTO;
+        return -1;
+    }
+
+    return 0;
+}
+
+static int start_cage(const char *cage, const char *rootfs, char *const argv[],
+                      pid_t *pid, int *ready_fd)
+{
+    int   pipe_fds[2];
+    pid_t child;
+
+    if (pipe(pipe_fds) == -1)
+        return -1;
+
+    child = fork();
+
+    if (child == -1) {
+        int saved_errno = errno;
+
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+
+        errno = saved_errno;
+        return -1;
+    }
+
+    if (child == 0) {
+        char  *args[32];
+        size_t i;
+
+        close(pipe_fds[0]);
+
+        if (dup2(pipe_fds[1], STDOUT_FILENO) == -1)
+            _exit(127);
+
+        close(pipe_fds[1]);
+
+        args[0] = ( char * )cage;
+        args[1] = ( char * )rootfs;
+
+        for (i = 0; argv[i] != NULL; i++)
+            args[i + 2] = argv[i];
+
+        args[i + 2] = NULL;
+
+        execv(cage, args);
+        _exit(127);
+    }
+
+    close(pipe_fds[1]);
+
+    *pid      = child;
+    *ready_fd = pipe_fds[0];
+
+    return 0;
+}
+
+static int wait_for_cage_ready(pid_t pid, int ready_fd)
+{
+    int status;
+
+    if (wait_for_ready(ready_fd) == 0) {
+        close(ready_fd);
+        return 0;
+    }
+
+    close(ready_fd);
+
+    if (kill(pid, SIGKILL) == -1 && errno != ESRCH)
+        return -1;
+
+    while (waitpid(pid, &status, 0) == -1) {
+        if (errno != EINTR)
+            return -1;
     }
 
     errno = ETIMEDOUT;
@@ -298,62 +393,23 @@ static int namespace_differs(pid_t pid, const char *name)
 
 static void test_network_namespace(const char *cage, const char *rootfs)
 {
-    char  ready_path[PATH_MAX];
-    char  container_ready_path[PATH_MAX];
-    char *argv[4];
+    char *argv[] = {
+            "/tests/container_probe",
+            "signal",
+            NULL,
+    };
     pid_t cage_pid;
     pid_t container_pid;
+    int   ready_fd;
     int   isolated;
     int   status;
 
-    if (snprintf(container_ready_path, sizeof(container_ready_path),
-                 "/tests/network.ready") >=
-        ( int )sizeof(container_ready_path)) {
-        test_fail("network namespace isolates networking",
-                  "ready path is too long");
-        return;
-    }
-
-    if (snprintf(ready_path, sizeof(ready_path), "%s%s", rootfs,
-                 container_ready_path) >= ( int )sizeof(ready_path)) {
-        test_fail("network namespace isolates networking",
-                  "host ready path is too long");
-        return;
-    }
-
-    unlink(ready_path);
-
-    argv[0]  = "/tests/container_probe";
-    argv[1]  = "signal";
-    argv[2]  = container_ready_path;
-    argv[3]  = NULL;
-
-    cage_pid = fork();
-
-    if (cage_pid == -1) {
+    if (start_cage(cage, rootfs, argv, &cage_pid, &ready_fd) == -1) {
         test_fail("network namespace isolates networking", strerror(errno));
         return;
     }
 
-    if (cage_pid == 0) {
-        char *args[6];
-
-        args[0] = ( char * )cage;
-        args[1] = ( char * )rootfs;
-        args[2] = argv[0];
-        args[3] = argv[1];
-        args[4] = argv[2];
-        args[5] = NULL;
-
-        execv(cage, args);
-        _exit(127);
-    }
-
-    if (wait_for_file(ready_path) == -1) {
-        kill(cage_pid, SIGKILL);
-        waitpid(cage_pid, NULL, 0);
-        unlink(ready_path);
-
+    if (wait_for_cage_ready(cage_pid, ready_fd) == -1) {
         test_fail("network namespace isolates networking",
                   "workload did not become ready");
         return;
@@ -362,7 +418,6 @@ static void test_network_namespace(const char *cage, const char *rootfs)
     if (find_container_pid(cage_pid, &container_pid) == -1) {
         kill(cage_pid, SIGKILL);
         waitpid(cage_pid, NULL, 0);
-        unlink(ready_path);
 
         test_fail("network namespace isolates networking",
                   "could not find container init");
@@ -373,7 +428,6 @@ static void test_network_namespace(const char *cage, const char *rootfs)
 
     kill(cage_pid, SIGTERM);
     waitpid(cage_pid, &status, 0);
-    unlink(ready_path);
 
     if (isolated == 1) {
         test_pass("network namespace isolates networking");
@@ -434,53 +488,22 @@ static void test_signal_forwarding(const char *cage, const char *rootfs)
     size_t i;
 
     for (i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
-        char  host_ready_path[PATH_MAX];
         char *argv[] = {
                 "/tests/container_probe",
                 "signal",
-                "/tests/signal.ready",
                 NULL,
         };
         pid_t pid;
+        int   ready_fd;
         int   status;
         int   expected;
 
-        if (snprintf(host_ready_path, sizeof(host_ready_path),
-                     "%s/tests/signal.ready",
-                     rootfs) >= ( int )sizeof(host_ready_path)) {
-            test_fail("signals are forwarded to workload",
-                      "ready path is too long");
-            continue;
-        }
-
-        unlink(host_ready_path);
-
-        pid = fork();
-
-        if (pid == -1) {
+        if (start_cage(cage, rootfs, argv, &pid, &ready_fd) == -1) {
             test_fail("signals are forwarded to workload", strerror(errno));
             continue;
         }
 
-        if (pid == 0) {
-            char *args[6];
-
-            args[0] = ( char * )cage;
-            args[1] = ( char * )rootfs;
-            args[2] = argv[0];
-            args[3] = argv[1];
-            args[4] = argv[2];
-            args[5] = NULL;
-
-            execv(cage, args);
-            _exit(127);
-        }
-
-        if (wait_for_file(host_ready_path) == -1) {
-            kill(pid, SIGKILL);
-            waitpid(pid, NULL, 0);
-            unlink(host_ready_path);
-
+        if (wait_for_cage_ready(pid, ready_fd) == -1) {
             test_fail("signals are forwarded to workload",
                       "workload did not become ready");
             continue;
@@ -489,7 +512,6 @@ static void test_signal_forwarding(const char *cage, const char *rootfs)
         if (kill(pid, signals[i]) == -1) {
             kill(pid, SIGKILL);
             waitpid(pid, NULL, 0);
-            unlink(host_ready_path);
 
             test_fail("signals are forwarded to workload", strerror(errno));
             continue;
@@ -502,10 +524,8 @@ static void test_signal_forwarding(const char *cage, const char *rootfs)
             if (errno == EINTR)
                 continue;
 
-            unlink(host_ready_path);
-
             test_fail("signals are forwarded to workload", strerror(errno));
-            continue;
+            break;
         }
 
         if (!WIFEXITED(status)) {
@@ -567,10 +587,6 @@ static int check_id_map(pid_t pid, const char *name, unsigned long host_id)
 
     buffer[count] = '\0';
 
-    /*
-     * /proc may use variable whitespace, so parse the three
-     * numeric fields rather than comparing the textual formatting.
-     */
     {
         unsigned long inside;
         unsigned long outside;
@@ -700,56 +716,26 @@ static void test_user_namespace(const char *cage, const char *rootfs)
 
 static void test_user_namespace_mapping(const char *cage, const char *rootfs)
 {
-    char  ready_path[PATH_MAX];
     char *argv[] = {
             "/tests/container_probe",
             "signal",
-            "/tests/signal.ready",
             NULL,
     };
     pid_t cage_pid;
     pid_t container_pid;
+    int   ready_fd;
     uid_t uid;
     gid_t gid;
     int   uid_result;
     int   gid_result;
     int   status;
 
-    if (snprintf(ready_path, sizeof(ready_path), "%s/tests/signal.ready",
-                 rootfs) >= ( int )sizeof(ready_path)) {
-        test_fail("user namespace maps UID/GID explicitly",
-                  "ready path is too long");
-        return;
-    }
-
-    unlink(ready_path);
-
-    cage_pid = fork();
-
-    if (cage_pid == -1) {
+    if (start_cage(cage, rootfs, argv, &cage_pid, &ready_fd) == -1) {
         test_fail("user namespace maps UID/GID explicitly", strerror(errno));
         return;
     }
 
-    if (cage_pid == 0) {
-        char *args[6];
-
-        args[0] = ( char * )cage;
-        args[1] = ( char * )rootfs;
-        args[2] = argv[0];
-        args[3] = argv[1];
-        args[4] = argv[2];
-        args[5] = NULL;
-
-        execv(cage, args);
-        _exit(127);
-    }
-
-    if (wait_for_file(ready_path) == -1) {
-        kill(cage_pid, SIGKILL);
-        waitpid(cage_pid, NULL, 0);
-        unlink(ready_path);
-
+    if (wait_for_cage_ready(cage_pid, ready_fd) == -1) {
         test_fail("user namespace maps UID/GID explicitly",
                   "workload did not become ready");
         return;
@@ -758,7 +744,6 @@ static void test_user_namespace_mapping(const char *cage, const char *rootfs)
     if (find_container_pid(cage_pid, &container_pid) == -1) {
         kill(cage_pid, SIGKILL);
         waitpid(cage_pid, NULL, 0);
-        unlink(ready_path);
 
         test_fail("user namespace maps UID/GID explicitly",
                   "could not find container init");
@@ -773,7 +758,6 @@ static void test_user_namespace_mapping(const char *cage, const char *rootfs)
 
     kill(cage_pid, SIGTERM);
     waitpid(cage_pid, &status, 0);
-    unlink(ready_path);
 
     if (uid_result == 1 && gid_result == 1) {
         test_pass("user namespace maps UID/GID explicitly");
@@ -851,61 +835,23 @@ static void test_mount_namespace(const char *cage, const char *rootfs)
 
 static void test_ipc_namespace(const char *cage, const char *rootfs)
 {
-    char  ready_path[PATH_MAX];
-    char  container_ready_path[PATH_MAX];
-    char *argv[4];
+    char *argv[] = {
+            "/tests/container_probe",
+            "signal",
+            NULL,
+    };
     pid_t cage_pid;
     pid_t container_pid;
+    int   ready_fd;
     int   isolated;
     int   status;
 
-    if (snprintf(container_ready_path, sizeof(container_ready_path),
-                 "/tests/ipc.ready") >= ( int )sizeof(container_ready_path)) {
-        test_fail("IPC namespace isolates IPC objects",
-                  "ready path is too long");
-        return;
-    }
-
-    if (snprintf(ready_path, sizeof(ready_path), "%s%s", rootfs,
-                 container_ready_path) >= ( int )sizeof(ready_path)) {
-        test_fail("IPC namespace isolates IPC objects",
-                  "host ready path is too long");
-        return;
-    }
-
-    unlink(ready_path);
-
-    argv[0]  = "/tests/container_probe";
-    argv[1]  = "signal";
-    argv[2]  = container_ready_path;
-    argv[3]  = NULL;
-
-    cage_pid = fork();
-
-    if (cage_pid == -1) {
+    if (start_cage(cage, rootfs, argv, &cage_pid, &ready_fd) == -1) {
         test_fail("IPC namespace isolates IPC objects", strerror(errno));
         return;
     }
 
-    if (cage_pid == 0) {
-        char *args[6];
-
-        args[0] = ( char * )cage;
-        args[1] = ( char * )rootfs;
-        args[2] = argv[0];
-        args[3] = argv[1];
-        args[4] = argv[2];
-        args[5] = NULL;
-
-        execv(cage, args);
-        _exit(127);
-    }
-
-    if (wait_for_file(ready_path) == -1) {
-        kill(cage_pid, SIGKILL);
-        waitpid(cage_pid, NULL, 0);
-        unlink(ready_path);
-
+    if (wait_for_cage_ready(cage_pid, ready_fd) == -1) {
         test_fail("IPC namespace isolates IPC objects",
                   "workload did not become ready");
         return;
@@ -914,7 +860,6 @@ static void test_ipc_namespace(const char *cage, const char *rootfs)
     if (find_container_pid(cage_pid, &container_pid) == -1) {
         kill(cage_pid, SIGKILL);
         waitpid(cage_pid, NULL, 0);
-        unlink(ready_path);
 
         test_fail("IPC namespace isolates IPC objects",
                   "could not find container init");
@@ -925,7 +870,6 @@ static void test_ipc_namespace(const char *cage, const char *rootfs)
 
     kill(cage_pid, SIGTERM);
     waitpid(cage_pid, &status, 0);
-    unlink(ready_path);
 
     if (isolated == 1) {
         test_pass("IPC namespace isolates IPC objects");

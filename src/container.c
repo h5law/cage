@@ -11,6 +11,7 @@
 #include <sys/mount.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -75,46 +76,50 @@ static int create_overlay_dirs(struct container *container)
 {
     if (snprintf(container->overlay_upper, sizeof(container->overlay_upper),
                  "%s/upper", container->private_dir) >=
-        ( int )sizeof(container->overlay_upper)) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
+        ( int )sizeof(container->overlay_upper))
+        goto path_too_long;
 
     if (snprintf(container->overlay_work, sizeof(container->overlay_work),
                  "%s/work", container->private_dir) >=
-        ( int )sizeof(container->overlay_work)) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
+        ( int )sizeof(container->overlay_work))
+        goto path_too_long;
 
     if (snprintf(container->overlay_root, sizeof(container->overlay_root),
                  "%s/root", container->private_dir) >=
-        ( int )sizeof(container->overlay_root)) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
+        ( int )sizeof(container->overlay_root))
+        goto path_too_long;
+
+    if (snprintf(container->overlay_old_root,
+                 sizeof(container->overlay_old_root), "%s/oldroot",
+                 container->overlay_root) >=
+        ( int )sizeof(container->overlay_old_root))
+        goto path_too_long;
 
     if (mkdir(container->overlay_upper, 0700) == -1)
         return -1;
 
-    if (mkdir(container->overlay_work, 0700) == -1) {
-        int saved_errno = errno;
+    if (mkdir(container->overlay_work, 0700) == -1)
+        goto fail_upper;
 
-        rmdir(container->overlay_upper);
-        errno = saved_errno;
-        return -1;
-    }
+    if (mkdir(container->overlay_root, 0700) == -1)
+        goto fail_work;
 
-    if (mkdir(container->overlay_root, 0700) == -1) {
-        int saved_errno = errno;
-
-        rmdir(container->overlay_work);
-        rmdir(container->overlay_upper);
-        errno = saved_errno;
-        return -1;
-    }
+    if (mkdir(container->overlay_old_root, 0700) == -1)
+        goto fail_root;
 
     return 0;
+
+fail_root:
+    rmdir(container->overlay_root);
+fail_work:
+    rmdir(container->overlay_work);
+fail_upper:
+    rmdir(container->overlay_upper);
+    return -1;
+
+path_too_long:
+    errno = ENAMETOOLONG;
+    return -1;
 }
 
 static int mount_overlay(struct container *container)
@@ -128,7 +133,54 @@ static int mount_overlay(struct container *container)
         return -1;
     }
 
-    return mount("overlay", container->overlay_root, "overlay", 0, options);
+    if (mount("overlay", container->overlay_root, "overlay", 0, options) == -1)
+        return -1;
+
+    return 0;
+}
+
+static int prepare_old_root(struct container *container)
+{
+    char old_root[PATH_MAX];
+
+    if (snprintf(old_root, sizeof(old_root), "%s/oldroot",
+                 container->overlay_root) >= ( int )sizeof(old_root)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if (mkdir(old_root, 0700) == -1)
+        return -1;
+
+    return 0;
+}
+
+static int pivot_root_to_overlay(struct container *container)
+{
+    char old_root[PATH_MAX];
+
+    if (snprintf(old_root, sizeof(old_root), "%s/oldroot",
+                 container->overlay_root) >= ( int )sizeof(old_root)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if (chdir(container->overlay_root) == -1)
+        return -1;
+
+    if (syscall(SYS_pivot_root, ".", "oldroot") == -1)
+        return -1;
+
+    if (chdir("/") == -1)
+        return -1;
+
+    if (umount2("/oldroot", MNT_DETACH) == -1)
+        return -1;
+
+    if (rmdir("/oldroot") == -1)
+        return -1;
+
+    return 0;
 }
 
 static void destroy_private_dir(struct container *container)
@@ -597,13 +649,18 @@ static int child_main(void *arg)
     if (make_mounts_private() == -1)
         return 1;
 
-    if (chroot(ctx->container->rootfs) == -1) {
-        perror("chroot");
+    if (mount_overlay(ctx->container) == -1) {
+        perror("mount overlay");
         return 1;
     }
 
-    if (chdir("/") == -1) {
-        perror("chdir");
+    if (prepare_old_root(ctx->container) == -1) {
+        perror("prepare old root");
+        return 1;
+    }
+
+    if (pivot_root_to_overlay(ctx->container) == -1) {
+        perror("pivot root");
         return 1;
     }
 

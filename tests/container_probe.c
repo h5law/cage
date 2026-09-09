@@ -74,27 +74,19 @@ static int check_lock(const char *path)
     return 0;
 }
 
-static int run_signal(const char *ready_path)
+static int run_signal(void)
 {
-    int fd;
-
-    fd = open(ready_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-
-    if (fd == -1)
+    if (write(STDOUT_FILENO, "ready\n", 6) != 6)
         return 1;
-
-    if (write(fd, "ready\n", 6) != 6) {
-        close(fd);
-        return 1;
-    }
-
-    close(fd);
 
     for (;;)
         pause();
 }
 
-static int check_pid_namespace(void) { return getppid() == 1 ? 0 : 1; }
+static int check_pid_namespace(void)
+{
+    return getppid() == 1 ? 0 : 1;
+}
 
 static int check_user_namespace(void)
 {
@@ -182,10 +174,10 @@ int main(int argc, char **argv)
     }
 
     if (strcmp(argv[1], "signal") == 0) {
-        if (argc != 3)
+        if (argc != 2)
             return 2;
 
-        return run_signal(argv[2]);
+        return run_signal();
     }
 
     if (strcmp(argv[1], "orphan") == 0) {
