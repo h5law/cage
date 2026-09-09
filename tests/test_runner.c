@@ -1063,6 +1063,68 @@ static void test_no_new_privs(const char *cage, const char *rootfs)
     }
 }
 
+static void test_fd_inheritance(const char *cage, const char *rootfs)
+{
+    char  fd_string[32];
+    char *argv[] = {
+            "/tests/container_probe",
+            "fd-inheritance",
+            fd_string,
+            NULL,
+    };
+    int fd;
+    int status;
+
+    /*
+     * Deliberately open a non-CLOEXEC descriptor so that it can only
+     * disappear from the workload if cage explicitly closes it.
+     */
+    fd = open("/dev/null", O_RDONLY);
+
+    if (fd == -1) {
+        test_fail("internal file descriptors are not inherited",
+                  strerror(errno));
+        return;
+    }
+
+    if (fd < 3) {
+        close(fd);
+        test_fail("internal file descriptors are not inherited",
+                  "sentinel descriptor was below fd 3");
+        return;
+    }
+
+    if (snprintf(fd_string, sizeof(fd_string), "%d", fd) >=
+        ( int )sizeof(fd_string)) {
+        close(fd);
+        test_fail("internal file descriptors are not inherited",
+                  "descriptor number is too long");
+        return;
+    }
+
+    status = run_cage(cage, rootfs, argv);
+
+    if (close(fd) == -1) {
+        test_fail("internal file descriptors are not inherited",
+                  "failed to close sentinel descriptor");
+        return;
+    }
+
+    if (status == 0) {
+        test_pass("internal file descriptors are not inherited");
+        return;
+    }
+
+    {
+        char reason[64];
+
+        snprintf(reason, sizeof(reason),
+                 "sentinel fd %d was inherited by workload", fd);
+
+        test_fail("internal file descriptors are not inherited", reason);
+    }
+}
+
 static void test_invalid_rootfs(const char *cage)
 {
     char *argv[] = {
@@ -1249,6 +1311,7 @@ int main(int argc, char **argv)
     test_ipc_namespace(argv[1], rootfs);
     test_capabilities(argv[1], rootfs);
     test_no_new_privs(argv[1], rootfs);
+    test_fd_inheritance(argv[1], rootfs);
     test_exec_failure(argv[1], rootfs);
     test_invalid_rootfs(argv[1]);
     test_parent_death(argv[1], rootfs);

@@ -28,6 +28,13 @@
 #define CAGE_RUNTIME_DIR "/tmp"
 #endif
 
+struct child_context {
+    struct container *container;
+    int               sync_fd;
+    int               parent_fd;
+    int               work_fd;
+};
+
 static int create_private_dir(struct container *container)
 {
     char template[PATH_MAX];
@@ -483,12 +490,13 @@ static int set_parent_death_signal(void)
     return 0;
 }
 
-struct child_context {
-    struct container *container;
-    int               sync_fd;
-    int               parent_fd;
-    int               work_fd;
-};
+static int close_inherited_fds(void)
+{
+    if (syscall(SYS_close_range, 3, UINT_MAX, 0) == -1)
+        return -1;
+
+    return 0;
+}
 
 static int verify_parent_alive(struct child_context *ctx)
 {
@@ -895,6 +903,14 @@ static int run_command(struct child_context *ctx)
         if (set_no_new_privs() == -1)
             _exit(127);
 
+        /*
+         * The command must not inherit any cage-internal file
+         * descriptors. Standard input/output/error (0, 1, 2)
+         * are deliberately preserved.
+         */
+        if (close_inherited_fds() == -1)
+            _exit(127);
+
         if (unblock_forwarded_signals() == -1)
             _exit(127);
 
@@ -1224,8 +1240,11 @@ int container_run(struct container *container)
      * The parent no longer needs either of these descriptors.
      * The child retains its inherited copies.
      */
-    close(sync_pipe[0]);
-    close(parent_fd);
+    if (close(sync_pipe[0]) == -1)
+        perror("close sync pipe read end");
+
+    if (close(parent_fd) == -1)
+        perror("close parent pidfd");
 
     if (container->pid == -1) {
         perror("clone");

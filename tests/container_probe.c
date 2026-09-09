@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/magic.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -250,6 +251,27 @@ static int check_no_new_privs(void)
     return 1;
 }
 
+static int check_fd_inheritance(const char *value)
+{
+    char       *end;
+    long        fd;
+    struct stat st;
+
+    errno = 0;
+    fd    = strtol(value, &end, 10);
+
+    if (errno != 0 || *end != '\0' || fd < 3 || fd > INT_MAX)
+        return 1;
+
+    if (fstat(( int )fd, &st) == 0)
+        return 1;
+
+    if (errno != EBADF)
+        return 1;
+
+    return 0;
+}
+
 static int run_uncooperative_orphan(const char *path)
 {
     struct sigaction action;
@@ -403,6 +425,13 @@ int main(int argc, char **argv)
             return 2;
 
         return check_no_new_privs();
+    }
+
+    if (strcmp(argv[1], "fd-inheritance") == 0) {
+        if (argc != 3)
+            return 2;
+
+        return check_fd_inheritance(argv[2]);
     }
 
     if (strcmp(argv[1], "uncooperative-orphan") == 0) {
