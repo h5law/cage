@@ -27,24 +27,44 @@ static volatile sig_atomic_t container_pid = -1;
 
 static int write_file(const char *path, const char *value)
 {
-    int     fd;
-    size_t  len;
-    ssize_t written;
+    int    fd;
+    size_t len;
+    size_t written;
 
     fd = open(path, O_WRONLY | O_CLOEXEC);
+
     if (fd == -1)
         return -1;
 
     len     = strlen(value);
+    written = 0;
 
-    written = write(fd, value, len);
-    if (written != ( ssize_t )len) {
-        int saved_errno = errno;
+    while (written < len) {
+        ssize_t result;
 
-        close(fd);
-        errno = saved_errno;
+        result = write(fd, value + written, len - written);
 
-        return -1;
+        if (result == -1) {
+            if (errno == EINTR)
+                continue;
+
+            {
+                int saved_errno = errno;
+
+                close(fd);
+                errno = saved_errno;
+            }
+
+            return -1;
+        }
+
+        if (result == 0) {
+            close(fd);
+            errno = EIO;
+            return -1;
+        }
+
+        written += ( size_t )result;
     }
 
     if (close(fd) == -1)
@@ -55,35 +75,59 @@ static int write_file(const char *path, const char *value)
 
 static int configure_user_namespace(pid_t pid)
 {
-    char path[128];
-    char map[128];
+    char  path[128];
+    char  map[128];
+    uid_t uid;
+    gid_t gid;
+    int   length;
 
-    uid_t uid = getuid();
-    gid_t gid = getgid();
+    uid    = getuid();
+    gid    = getgid();
 
-    /*
-     * An unprivileged process must disable setgroups before it
-     * can write gid_map.
-     */
-    snprintf(path, sizeof(path), "/proc/%d/setgroups", pid);
+    length = snprintf(path, sizeof(path), "/proc/%ld/setgroups", ( long )pid);
+
+    if (length < 0 || ( size_t )length >= sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
 
     if (write_file(path, "deny") == -1 && errno != ENOENT) {
         perror("write setgroups");
         return -1;
     }
 
-    snprintf(map, sizeof(map), "0 %u 1", ( unsigned )uid);
+    length = snprintf(map, sizeof(map), "0 %lu 1", ( unsigned long )uid);
 
-    snprintf(path, sizeof(path), "/proc/%d/uid_map", pid);
+    if (length < 0 || ( size_t )length >= sizeof(map)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    length = snprintf(path, sizeof(path), "/proc/%ld/uid_map", ( long )pid);
+
+    if (length < 0 || ( size_t )length >= sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
 
     if (write_file(path, map) == -1) {
         perror("write uid_map");
         return -1;
     }
 
-    snprintf(map, sizeof(map), "0 %u 1", ( unsigned )gid);
+    length = snprintf(map, sizeof(map), "0 %lu 1", ( unsigned long )gid);
 
-    snprintf(path, sizeof(path), "/proc/%d/gid_map", pid);
+    if (length < 0 || ( size_t )length >= sizeof(map)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    length = snprintf(path, sizeof(path), "/proc/%ld/gid_map", ( long )pid);
+
+    if (length < 0 || ( size_t )length >= sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
 
     if (write_file(path, map) == -1) {
         perror("write gid_map");
@@ -119,7 +163,11 @@ static int wait_for_parent(struct child_context *ctx)
         return -1;
     }
 
-    close(ctx->sync_fd);
+    if (close(ctx->sync_fd) == -1) {
+        ctx->sync_fd = -1;
+        return -1;
+    }
+
     ctx->sync_fd = -1;
 
     return 0;
@@ -146,12 +194,16 @@ static int terminate_descendants(void)
     struct timespec deadline;
 
     /*
-     * Send SIGTERM to every process in this PID namespace except
-     * cage-init itself.
+     * cage-init is PID 1 in the container PID namespace.
+     * kill(-1, ...) therefore targets every other process that
+     * cage-init is permitted to signal.
      */
     if (kill(-1, SIGTERM) == -1 && errno != ESRCH) {
+        /*
+         * Failure to signal one or more descendants must not prevent
+         * the final SIGKILL/reap phase from running.
+         */
         perror("terminate descendants");
-        return -1;
     }
 
     if (clock_gettime(CLOCK_MONOTONIC, &deadline) == -1) {
@@ -166,9 +218,12 @@ static int terminate_descendants(void)
         deadline.tv_nsec %= 1000000000L;
     }
 
-    while (!deadline_expired(&deadline)) {
+    for (;;) {
         int   status;
         pid_t pid;
+
+        if (deadline_expired(&deadline))
+            break;
 
         pid = waitpid(-1, &status, WNOHANG);
 
@@ -183,7 +238,7 @@ static int terminate_descendants(void)
                 return 0;
 
             perror("waitpid");
-            return -1;
+            break;
         }
 
         {
@@ -192,7 +247,7 @@ static int terminate_descendants(void)
                     .tv_nsec = 10000000L,
             };
 
-            while (nanosleep(&interval, &interval) == -1) {
+            while (nanosleep(&interval, NULL) == -1) {
                 if (errno != EINTR)
                     break;
             }
@@ -200,15 +255,11 @@ static int terminate_descendants(void)
     }
 
     /*
-     * Anything still alive after the grace period gets SIGKILL.
-     *
-     * kill(-1, ...) targets every process we are permitted to signal
-     * in this PID namespace except the caller itself.
+     * Anything still alive after the grace period must not survive
+     * the container.
      */
-    if (kill(-1, SIGKILL) == -1 && errno != ESRCH) {
+    if (kill(-1, SIGKILL) == -1 && errno != ESRCH)
         perror("kill descendants");
-        return -1;
-    }
 
     for (;;) {
         int   status;
@@ -233,10 +284,16 @@ static int terminate_descendants(void)
 
 static void forward_command_signal(int signal)
 {
-    pid_t pid = ( pid_t )command_pid;
+    int   saved_errno;
+    pid_t pid;
+
+    saved_errno = errno;
+    pid         = ( pid_t )command_pid;
 
     if (pid > 0)
-        kill(pid, signal);
+        ( void )kill(pid, signal);
+
+    errno = saved_errno;
 }
 
 static int install_command_signal_handlers(void)
@@ -270,10 +327,10 @@ static void reset_signal_handlers(void)
     action.sa_handler = SIG_DFL;
     sigemptyset(&action.sa_mask);
 
-    sigaction(SIGTERM, &action, NULL);
-    sigaction(SIGINT, &action, NULL);
-    sigaction(SIGHUP, &action, NULL);
-    sigaction(SIGQUIT, &action, NULL);
+    ( void )sigaction(SIGTERM, &action, NULL);
+    ( void )sigaction(SIGINT, &action, NULL);
+    ( void )sigaction(SIGHUP, &action, NULL);
+    ( void )sigaction(SIGQUIT, &action, NULL);
 }
 
 static int unblock_forwarded_signals(void)
@@ -287,6 +344,45 @@ static int unblock_forwarded_signals(void)
     sigaddset(&set, SIGQUIT);
 
     return sigprocmask(SIG_UNBLOCK, &set, NULL);
+}
+
+static int wait_for_command(pid_t command, int *command_status)
+{
+    for (;;) {
+        int   status;
+        pid_t pid;
+
+        pid = waitpid(-1, &status, 0);
+
+        if (pid == -1) {
+            if (errno == EINTR)
+                continue;
+
+            if (errno == ECHILD) {
+                errno = ECHILD;
+                return -1;
+            }
+
+            perror("waitpid");
+            return -1;
+        }
+
+        if (pid != command)
+            continue;
+
+        if (WIFEXITED(status)) {
+            *command_status = WEXITSTATUS(status);
+            return 0;
+        }
+
+        if (WIFSIGNALED(status)) {
+            *command_status = 128 + WTERMSIG(status);
+            return 0;
+        }
+
+        *command_status = 1;
+        return 0;
+    }
 }
 
 static int run_command(struct child_context *ctx)
@@ -306,10 +402,6 @@ static int run_command(struct child_context *ctx)
     }
 
     if (pid == 0) {
-        /*
-         * The workload must receive normal signal semantics rather
-         * than inheriting cage-init's forwarding handlers.
-         */
         reset_signal_handlers();
 
         if (unblock_forwarded_signals() == -1)
@@ -324,61 +416,40 @@ static int run_command(struct child_context *ctx)
     command_pid = pid;
 
     /*
-     * The child PID is now published. Signals can safely be
-     * delivered to cage-init.
+     * The command PID is now published, so cage-init can safely
+     * receive forwarded signals.
      */
     if (unblock_forwarded_signals() == -1) {
-        kill(pid, SIGKILL);
-        waitpid(pid, NULL, 0);
+        perror("sigprocmask");
+
+        if (kill(pid, SIGKILL) == -1 && errno != ESRCH)
+            perror("kill command");
+
+        while (waitpid(pid, NULL, 0) == -1) {
+            if (errno != EINTR)
+                break;
+        }
+
+        command_pid = -1;
+
+        return 1;
+    }
+
+    if (wait_for_command(pid, &status) == -1) {
         command_pid = -1;
         return 1;
     }
 
-    /*
-     * PID 1 must reap every child it owns.
-     */
-    for (;;) {
-        pid_t waited = waitpid(-1, &status, 0);
-
-        if (waited == -1) {
-            if (errno == EINTR)
-                continue;
-
-            if (errno == ECHILD)
-                break;
-
-            perror("waitpid");
-            command_pid = -1;
-            return 1;
-        }
-
-        if (waited == pid) {
-            int command_status;
-
-            command_pid = -1;
-
-            if (WIFEXITED(status))
-                command_status = WEXITSTATUS(status);
-            else if (WIFSIGNALED(status))
-                command_status = 128 + WTERMSIG(status);
-            else
-                command_status = 1;
-
-            /*
-             * The requested command has exited. Any remaining
-             * processes are descendants that must not survive
-             * container teardown.
-             */
-            if (terminate_descendants() == -1)
-                return 1;
-
-            return command_status;
-        }
-    }
-
     command_pid = -1;
 
-    return 1;
+    /*
+     * The requested command has exited. Any remaining processes
+     * belong to the command's descendant tree and must be removed.
+     */
+    if (terminate_descendants() == -1)
+        return 1;
+
+    return status;
 }
 
 static int child_main(void *arg)
@@ -403,8 +474,10 @@ static int child_main(void *arg)
         return 1;
     }
 
-    if (chdir("/") == -1)
+    if (chdir("/") == -1) {
+        perror("chdir");
         return 1;
+    }
 
     if (install_command_signal_handlers() == -1) {
         perror("install signal handlers");
@@ -418,10 +491,16 @@ static int child_main(void *arg)
 
 static void forward_container_signal(int signal)
 {
-    pid_t pid = ( pid_t )container_pid;
+    int   saved_errno;
+    pid_t pid;
+
+    saved_errno = errno;
+    pid         = ( pid_t )container_pid;
 
     if (pid > 0)
-        kill(pid, signal);
+        ( void )kill(pid, signal);
+
+    errno = saved_errno;
 }
 
 static int install_container_signal_handlers(void)
@@ -455,10 +534,10 @@ static void reset_container_signal_handlers(void)
     action.sa_handler = SIG_DFL;
     sigemptyset(&action.sa_mask);
 
-    sigaction(SIGTERM, &action, NULL);
-    sigaction(SIGINT, &action, NULL);
-    sigaction(SIGHUP, &action, NULL);
-    sigaction(SIGQUIT, &action, NULL);
+    ( void )sigaction(SIGTERM, &action, NULL);
+    ( void )sigaction(SIGINT, &action, NULL);
+    ( void )sigaction(SIGHUP, &action, NULL);
+    ( void )sigaction(SIGQUIT, &action, NULL);
 }
 
 static int block_forwarded_signals(sigset_t *old_mask)
@@ -479,6 +558,26 @@ static int restore_signal_mask(const sigset_t *mask)
     return sigprocmask(SIG_SETMASK, mask, NULL);
 }
 
+static void kill_and_reap_container(pid_t pid)
+{
+    if (kill(pid, SIGKILL) == -1 && errno != ESRCH)
+        perror("kill container");
+
+    for (;;) {
+        if (waitpid(pid, NULL, 0) != -1)
+            break;
+
+        if (errno == EINTR)
+            continue;
+
+        if (errno == ECHILD || errno == ESRCH)
+            break;
+
+        perror("waitpid");
+        break;
+    }
+}
+
 int container_run(struct container *container)
 {
     struct child_context ctx;
@@ -487,9 +586,8 @@ int container_run(struct container *container)
     char                *stack_top;
     int                  sync_pipe[2];
     int                  status;
-    char                 ready              = 1;
-    int                  signals_blocked    = 0;
-    int                  handlers_installed = 0;
+    char                 ready;
+    int                  handlers_installed;
 
     if (container == NULL || container->rootfs == NULL ||
         container->argv == NULL || container->argv[0] == NULL) {
@@ -497,25 +595,28 @@ int container_run(struct container *container)
         return -1;
     }
 
+    container->pid = -1;
+    command_pid    = -1;
+    container_pid  = -1;
+
     if (block_forwarded_signals(&old_mask) == -1) {
         perror("sigprocmask");
         return -1;
     }
 
-    signals_blocked = 1;
-
     if (pipe2(sync_pipe, O_CLOEXEC) == -1) {
         perror("pipe2");
-        restore_signal_mask(&old_mask);
+        ( void )restore_signal_mask(&old_mask);
         return -1;
     }
 
     stack = malloc(STACK_SIZE);
+
     if (stack == NULL) {
         perror("malloc");
         close(sync_pipe[0]);
         close(sync_pipe[1]);
-        restore_signal_mask(&old_mask);
+        ( void )restore_signal_mask(&old_mask);
         return -1;
     }
 
@@ -538,66 +639,94 @@ int container_run(struct container *container)
         perror("clone");
         free(stack);
         close(sync_pipe[1]);
-        restore_signal_mask(&old_mask);
+        ( void )restore_signal_mask(&old_mask);
         return -1;
     }
 
+    container_pid      = container->pid;
+    handlers_installed = 0;
+
     /*
-     * container->pid is now valid while signals are still blocked.
      * Install forwarding before allowing signals through.
      */
-    container_pid = container->pid;
-
     if (install_container_signal_handlers() == -1) {
         perror("install signal handlers");
-        kill(container->pid, SIGKILL);
+        kill_and_reap_container(container->pid);
         close(sync_pipe[1]);
-        waitpid(container->pid, NULL, 0);
-        container_pid = -1;
+        container_pid  = -1;
+        container->pid = -1;
         free(stack);
-        restore_signal_mask(&old_mask);
+        ( void )restore_signal_mask(&old_mask);
         return -1;
     }
 
     handlers_installed = 1;
 
     if (configure_user_namespace(container->pid) == -1) {
-        kill(container->pid, SIGKILL);
+        kill_and_reap_container(container->pid);
         close(sync_pipe[1]);
-        waitpid(container->pid, NULL, 0);
-        container_pid = -1;
+        container_pid  = -1;
+        container->pid = -1;
         reset_container_signal_handlers();
         free(stack);
-        restore_signal_mask(&old_mask);
+        ( void )restore_signal_mask(&old_mask);
         return -1;
     }
 
-    /*
-     * Release cage-init once its identity has been configured.
-     */
+    ready = 1;
+
     if (write(sync_pipe[1], &ready, sizeof(ready)) != sizeof(ready)) {
+        int saved_errno = errno;
+
         perror("release container");
-        kill(container->pid, SIGKILL);
+
+        kill_and_reap_container(container->pid);
         close(sync_pipe[1]);
-        waitpid(container->pid, NULL, 0);
-        container_pid = -1;
-        reset_container_signal_handlers();
+
+        container_pid  = -1;
+        container->pid = -1;
+
+        if (handlers_installed)
+            reset_container_signal_handlers();
+
         free(stack);
-        restore_signal_mask(&old_mask);
+        ( void )restore_signal_mask(&old_mask);
+
+        errno = saved_errno;
         return -1;
     }
 
-    close(sync_pipe[1]);
+    if (close(sync_pipe[1]) == -1) {
+        int saved_errno = errno;
+
+        perror("close sync pipe");
+
+        kill_and_reap_container(container->pid);
+
+        container_pid  = -1;
+        container->pid = -1;
+
+        if (handlers_installed)
+            reset_container_signal_handlers();
+
+        free(stack);
+        ( void )restore_signal_mask(&old_mask);
+
+        errno = saved_errno;
+        return -1;
+    }
 
     /*
      * The container is fully established. Signals can now reach
-     * the forwarding handler.
+     * the host-side forwarding handler.
      */
     if (restore_signal_mask(&old_mask) == -1) {
         perror("sigprocmask");
-        kill(container->pid, SIGKILL);
-        waitpid(container->pid, NULL, 0);
-        container_pid = -1;
+
+        kill_and_reap_container(container->pid);
+
+        container_pid  = -1;
+        container->pid = -1;
 
         if (handlers_installed)
             reset_container_signal_handlers();
@@ -606,44 +735,37 @@ int container_run(struct container *container)
         return -1;
     }
 
-    signals_blocked = 0;
+    /*
+     * Forwarded signals interrupt waitpid(), so always retry.
+     */
+    for (;;) {
+        if (waitpid(container->pid, &status, 0) != -1)
+            break;
 
-    if (waitpid(container->pid, &status, 0) == -1) {
-        if (errno == EINTR) {
-            /*
-             * A forwarded signal interrupts waitpid(). Continue
-             * waiting for the container to terminate.
-             */
-            for (;;) {
-                if (waitpid(container->pid, &status, 0) != -1)
-                    break;
+        if (errno == EINTR)
+            continue;
 
-                if (errno != EINTR) {
-                    perror("waitpid");
-                    container_pid = -1;
-                    reset_container_signal_handlers();
-                    free(stack);
-                    return -1;
-                }
-            }
-        } else {
-            perror("waitpid");
-            container_pid = -1;
+        perror("waitpid");
+
+        kill_and_reap_container(container->pid);
+
+        container_pid  = -1;
+        container->pid = -1;
+
+        if (handlers_installed)
             reset_container_signal_handlers();
-            free(stack);
-            return -1;
-        }
+
+        free(stack);
+        return -1;
     }
 
-    container_pid = -1;
+    container_pid  = -1;
+    container->pid = -1;
 
     if (handlers_installed)
         reset_container_signal_handlers();
 
     free(stack);
-
-    if (signals_blocked)
-        restore_signal_mask(&old_mask);
 
     if (WIFEXITED(status))
         return WEXITSTATUS(status);
