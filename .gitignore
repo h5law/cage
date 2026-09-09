@@ -7,3 +7,7 @@ cage
 # rootfs
 rootfs/*
 rootfs/
+
+# Test Binaries
+tests/test_runner
+tests/container_probe
