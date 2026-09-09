@@ -71,6 +71,43 @@ static int create_private_dir(struct container *container)
     return 0;
 }
 
+static int create_overlay_dirs(struct container *container)
+{
+    char upper[PATH_MAX];
+    char work[PATH_MAX];
+    char root[PATH_MAX];
+
+    if (snprintf(upper, sizeof(upper), "%s/upper", container->private_dir) >=
+                ( int )sizeof(upper) ||
+        snprintf(work, sizeof(work), "%s/work", container->private_dir) >=
+                ( int )sizeof(work) ||
+        snprintf(root, sizeof(root), "%s/root", container->private_dir) >=
+                ( int )sizeof(root)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if (mkdir(upper, 0700) == -1)
+        return -1;
+
+    if (mkdir(work, 0700) == -1) {
+        int saved_errno = errno;
+        rmdir(upper);
+        errno = saved_errno;
+        return -1;
+    }
+
+    if (mkdir(root, 0700) == -1) {
+        int saved_errno = errno;
+        rmdir(work);
+        rmdir(upper);
+        errno = saved_errno;
+        return -1;
+    }
+
+    return 0;
+}
+
 static void destroy_private_dir(struct container *container)
 {
     if (container->private_dir_fd != -1) {
@@ -671,6 +708,12 @@ int container_run(struct container *container)
 
     if (create_private_dir(container) == -1) {
         perror("create private directory");
+        return -1;
+    }
+
+    if (create_overlay_dirs(container) == -1) {
+        perror("create overlay directories");
+        destroy_private_dir(container);
         return -1;
     }
 
