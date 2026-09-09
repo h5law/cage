@@ -16,6 +16,8 @@
 struct child_context {
     const char *rootfs;
     char      **argv;
+
+    int sync_fd;
 };
 
 static int write_file(const char *path, const char *value)
@@ -96,9 +98,40 @@ static int make_mounts_private(void)
     return 0;
 }
 
+static int wait_for_parent(struct child_context *ctx)
+{
+    char    byte;
+    ssize_t result;
+
+    do {
+        result = read(ctx->sync_fd, &byte, sizeof(byte));
+    } while (result == -1 && errno == EINTR);
+
+    if (result != sizeof(byte)) {
+        if (result == 0)
+            errno = ECANCELED;
+
+        return -1;
+    }
+
+    close(ctx->sync_fd);
+    ctx->sync_fd = -1;
+
+    return 0;
+}
+
 static int child_main(void *arg)
 {
     struct child_context *ctx = arg;
+
+    /*
+     * Do not perform any namespace-dependent setup until the parent
+     * has established the UID/GID mappings.
+     */
+    if (wait_for_parent(ctx) == -1) {
+        perror("wait for namespace setup");
+        return 1;
+    }
 
     if (make_mounts_private() == -1)
         return 1;
@@ -124,7 +157,9 @@ int container_run(struct container *container)
     struct child_context ctx;
     char                *stack;
     char                *stack_top;
+    int                  sync_pipe[2];
     int                  status;
+    char                 ready = 1;
 
     if (container == NULL || container->rootfs == NULL ||
         container->argv == NULL || container->argv[0] == NULL) {
@@ -132,15 +167,23 @@ int container_run(struct container *container)
         return -1;
     }
 
+    if (pipe2(sync_pipe, O_CLOEXEC) == -1) {
+        perror("pipe2");
+        return -1;
+    }
+
     stack = malloc(STACK_SIZE);
     if (stack == NULL) {
         perror("malloc");
+        close(sync_pipe[0]);
+        close(sync_pipe[1]);
         return -1;
     }
 
     ctx = (struct child_context){
-            .rootfs = container->rootfs,
-            .argv   = container->argv,
+            .rootfs  = container->rootfs,
+            .argv    = container->argv,
+            .sync_fd = sync_pipe[0],
     };
 
     stack_top      = stack + STACK_SIZE;
@@ -150,19 +193,35 @@ int container_run(struct container *container)
                                    CLONE_NEWNET | CLONE_NEWIPC | SIGCHLD,
                            &ctx);
 
+    close(sync_pipe[0]);
+
     if (container->pid == -1) {
         perror("clone");
         free(stack);
+        close(sync_pipe[1]);
         return -1;
     }
 
     if (configure_user_namespace(container->pid) == -1) {
         kill(container->pid, SIGKILL);
+        close(sync_pipe[1]);
         waitpid(container->pid, NULL, 0);
         free(stack);
 
         return -1;
     }
+
+    if (write(sync_pipe[1], &ready, sizeof(ready)) != sizeof(ready)) {
+        perror("release container");
+        kill(container->pid, SIGKILL);
+        close(sync_pipe[1]);
+        waitpid(container->pid, NULL, 0);
+        free(stack);
+
+        return -1;
+    }
+
+    close(sync_pipe[1]);
 
     if (waitpid(container->pid, &status, 0) == -1) {
         perror("waitpid");
