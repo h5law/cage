@@ -1,2 +1,9 @@
 # Binary
 cage
+
+# Outputs
+*/*.o
+
+# rootfs
+rootfs/*
+rootfs/

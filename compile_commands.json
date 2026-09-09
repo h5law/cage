@@ -1,0 +1,21 @@
+[
+  {
+    "file": "src/container.c",
+    "arguments": [
+      "/usr/bin/cc",
+      "-D_GNU_SOURCE",
+      "-std=c11",
+      "-O2",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-Iinclude",
+      "-c",
+      "src/container.c",
+      "-o",
+      "src/container.o"
+    ],
+    "directory": "/home/saint/development/projects/cage",
+    "output": "src/container.o"
+  }
+]
