@@ -57,8 +57,8 @@ static int configure_user_namespace(pid_t pid)
     gid_t gid = getgid();
 
     /*
-     * An unprivileged process must disable setgroups before it can
-     * write gid_map.
+     * An unprivileged process must disable setgroups before it
+     * can write gid_map.
      */
     snprintf(path, sizeof(path), "/proc/%d/setgroups", pid);
 
@@ -120,13 +120,65 @@ static int wait_for_parent(struct child_context *ctx)
     return 0;
 }
 
+static int run_command(struct child_context *ctx)
+{
+    pid_t pid;
+    int   status;
+
+    pid = fork();
+
+    if (pid == -1) {
+        perror("fork");
+        return 1;
+    }
+
+    if (pid == 0) {
+        execvp(ctx->argv[0], ctx->argv);
+
+        perror("exec");
+        _exit(127);
+    }
+
+    /*
+     * PID 1 must reap every child it owns.  For now there is only
+     * the requested command, but this also gives us the correct
+     * primitive for orphaned descendants.
+     */
+    for (;;) {
+        pid_t waited = waitpid(-1, &status, 0);
+
+        if (waited == -1) {
+            if (errno == EINTR)
+                continue;
+
+            if (errno == ECHILD)
+                break;
+
+            perror("waitpid");
+            return 1;
+        }
+
+        if (waited == pid) {
+            if (WIFEXITED(status))
+                return WEXITSTATUS(status);
+
+            if (WIFSIGNALED(status))
+                return 128 + WTERMSIG(status);
+
+            return 1;
+        }
+    }
+
+    return 1;
+}
+
 static int child_main(void *arg)
 {
     struct child_context *ctx = arg;
+    int                   status;
 
     /*
-     * Do not perform any namespace-dependent setup until the parent
-     * has established the UID/GID mappings.
+     * Wait until the parent has established the UID/GID mappings.
      */
     if (wait_for_parent(ctx) == -1) {
         perror("wait for namespace setup");
@@ -146,10 +198,14 @@ static int child_main(void *arg)
         return 1;
     }
 
-    execvp(ctx->argv[0], ctx->argv);
+    /*
+     * We are PID 1 inside the new PID namespace.
+     * Run the requested command as our child rather than replacing
+     * ourselves with it.
+     */
+    status = run_command(ctx);
 
-    perror("exec");
-    return 127;
+    return status;
 }
 
 int container_run(struct container *container)
@@ -211,6 +267,10 @@ int container_run(struct container *container)
         return -1;
     }
 
+    /*
+     * Release the cage-init process once its identity has
+     * been configured.
+     */
     if (write(sync_pipe[1], &ready, sizeof(ready)) != sizeof(ready)) {
         perror("release container");
         kill(container->pid, SIGKILL);
