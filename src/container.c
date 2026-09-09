@@ -1,6 +1,7 @@
 #include "container.h"
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <sched.h>
@@ -263,23 +264,142 @@ static int mount_proc(struct container *container)
     return 0;
 }
 
-static void destroy_private_dir(struct container *container)
+static int cleanup_mounts(void)
 {
-    if (container->private_dir_fd != -1) {
-        flock(container->private_dir_fd, LOCK_UN);
-        close(container->private_dir_fd);
-        container->private_dir_fd = -1;
+    static const char *const devices[] = {
+            "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty",
+    };
+
+    for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
+        if (umount2(devices[i], MNT_DETACH) == -1 && errno != EINVAL &&
+            errno != ENOENT)
+            return -1;
     }
 
-    if (container->private_dir[0] != '\0') {
-        rmdir(container->private_dir);
-        container->private_dir[0] = '\0';
+    if (umount2("/tmp", MNT_DETACH) == -1 && errno != EINVAL && errno != ENOENT)
+        return -1;
+
+    if (umount2("/dev", MNT_DETACH) == -1 && errno != EINVAL && errno != ENOENT)
+        return -1;
+
+    if (umount2("/proc", MNT_DETACH) == -1 && errno != EINVAL &&
+        errno != ENOENT)
+        return -1;
+
+    /*
+     * After pivot_root(), the OverlayFS mount is the container's
+     * root filesystem.
+     */
+    if (umount2("/", MNT_DETACH) == -1 && errno != EINVAL && errno != ENOENT)
+        return -1;
+
+    return 0;
+}
+
+static int cleanup_overlay_work(int work_fd)
+{
+    int internal_work_fd;
+
+    internal_work_fd =
+            openat(work_fd, "work", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+    if (internal_work_fd == -1) {
+        if (errno == ENOENT)
+            return 0;
+
+        return -1;
+    }
+
+    if (fchmod(internal_work_fd, 0700) == -1) {
+        int saved_errno = errno;
+
+        close(internal_work_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    if (close(internal_work_fd) == -1)
+        return -1;
+
+    return 0;
+}
+
+static int remove_tree(const char *path)
+{
+    DIR           *dir;
+    struct dirent *entry;
+    struct stat    st;
+    char           child[PATH_MAX];
+
+    dir = opendir(path);
+    if (dir == NULL) {
+        if (errno == ENOENT)
+            return 0;
+
+        return -1;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        if (snprintf(child, sizeof(child), "%s/%s", path, entry->d_name) >=
+            ( int )sizeof(child)) {
+            errno = ENAMETOOLONG;
+            closedir(dir);
+            return -1;
+        }
+
+        if (lstat(child, &st) == -1) {
+            if (errno == ENOENT)
+                continue;
+
+            closedir(dir);
+            return -1;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            if (remove_tree(child) == -1) {
+                closedir(dir);
+                return -1;
+            }
+        } else {
+            if (unlink(child) == -1) {
+                closedir(dir);
+                return -1;
+            }
+        }
+    }
+
+    if (closedir(dir) == -1)
+        return -1;
+
+    return rmdir(path);
+}
+
+static int remove_runtime_tree(struct container *container)
+{
+    return remove_tree(container->private_dir);
+}
+
+static void destroy_private_dir(struct container *container)
+{
+    if (remove_runtime_tree(container) == -1)
+        perror("remove runtime tree");
+
+    if (container->private_dir_fd != -1) {
+        if (flock(container->private_dir_fd, LOCK_UN) == -1)
+            perror("unlock private directory");
+
+        close(container->private_dir_fd);
+        container->private_dir_fd = -1;
     }
 }
 
 struct child_context {
     struct container *container;
     int               sync_fd;
+    int               work_fd;
 };
 
 static volatile sig_atomic_t command_pid   = -1;
@@ -749,8 +869,18 @@ static int child_main(void *arg)
         return 1;
     }
 
+    ctx->work_fd = open(ctx->container->overlay_work,
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+    if (ctx->work_fd == -1) {
+        perror("open overlay work directory");
+        return 1;
+    }
+
     if (pivot_root_to_overlay(ctx->container) == -1) {
         perror("pivot root");
+        close(ctx->work_fd);
+        ctx->work_fd = -1;
         return 1;
     }
 
@@ -765,6 +895,17 @@ static int child_main(void *arg)
     }
 
     status = run_command(ctx);
+
+    if (cleanup_mounts() == -1)
+        perror("cleanup mounts");
+
+    if (ctx->work_fd != -1) {
+        if (cleanup_overlay_work(ctx->work_fd) == -1)
+            perror("cleanup overlay work");
+
+        close(ctx->work_fd);
+        ctx->work_fd = -1;
+    }
 
     return status;
 }
@@ -917,6 +1058,7 @@ int container_run(struct container *container)
     ctx = (struct child_context){
             .container = container,
             .sync_fd   = sync_pipe[0],
+            .work_fd   = -1,
     };
 
     stack_top      = stack + STACK_SIZE;
