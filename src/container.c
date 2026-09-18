@@ -1,4 +1,5 @@
-#include "container.h"
+#include <container.h>
+#include <config.h>
 
 #include <dirent.h>
 #include <errno.h>
@@ -272,6 +273,77 @@ static int mount_proc(struct container *container)
     if (mount("proc", proc_path, "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV,
               "subset=pid") == -1)
         return -1;
+
+    return 0;
+}
+
+static int create_mount_target(const char *target)
+{
+    struct stat st;
+
+    if (stat(target, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "cage: mount target '%s' is not a directory\n",
+                    target);
+            errno = ENOTDIR;
+            return -1;
+        }
+
+        return 0;
+    }
+
+    if (errno != ENOENT)
+        return -1;
+
+    if (mkdir(target, 0755) == -1)
+        return -1;
+
+    return 0;
+}
+
+static int mount_configured_mount(const struct mount_config *mount_config)
+{
+    if (create_mount_target(mount_config->target) == -1) {
+        fprintf(stderr, "cage: failed to create mount target '%s': %s\n",
+                mount_config->target, strerror(errno));
+        return -1;
+    }
+
+    if (mount(mount_config->source, mount_config->target, NULL,
+              MS_BIND | MS_REC, NULL) == -1) {
+        fprintf(stderr, "cage: failed to mount '%s' on '%s': %s\n",
+                mount_config->source, mount_config->target, strerror(errno));
+        return -1;
+    }
+
+    if (mount_config->readonly) {
+        if (mount(NULL, mount_config->target, NULL,
+                  MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) == -1) {
+            fprintf(stderr, "cage: failed to make mount '%s' read-only: %s\n",
+                    mount_config->target, strerror(errno));
+
+            /*
+             * The bind mount was successfully created, so remove it
+             * before reporting failure.
+             */
+            if (umount2(mount_config->target, MNT_DETACH) == -1)
+                perror("umount configured mount");
+
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int mount_configured_mounts(const struct cage_config *config)
+{
+    size_t i;
+
+    for (i = 0; i < config->mount_count; i++) {
+        if (mount_configured_mount(&config->mounts[i]) == -1)
+            return -1;
+    }
 
     return 0;
 }
@@ -1176,7 +1248,7 @@ int container_run(struct container *container)
     char                 ready;
     int                  handlers_installed;
 
-    if (container == NULL || container->rootfs == NULL ||
+    if (container == NULL || container->config->rootfs == NULL ||
         container->argv == NULL || container->argv[0] == NULL) {
         errno = EINVAL;
         return -1;

@@ -7,7 +7,8 @@ TARGET := cage
 
 SOURCES := \
 	src/cage.c \
-	src/container.c
+	src/container.c \
+	src/config.c
 
 OBJECTS := $(SOURCES:.c=.o)
 

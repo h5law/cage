@@ -5,9 +5,9 @@
 #include <sys/types.h>
 
 struct container {
-    const char *rootfs;
-    char      **argv;
-    pid_t       pid;
+    const struct cage_config *config;
+    char                    **argv;
+    pid_t                     pid;
 
     char private_dir[PATH_MAX];
     char overlay_upper[PATH_MAX];

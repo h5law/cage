@@ -1,0 +1,10 @@
+rootfs = "./rootfs"
+
+[[mounts]]
+source = "/tmp/mount-me"
+target = "/data"
+
+[[mounts]]
+source = "/home/saint/project"
+target = "/workspace"
+readonly = true
