@@ -3,6 +3,7 @@ cage
 
 # Outputs
 */*.o
+compile_commands.json
 
 # rootfs
 rootfs/*
