@@ -136,7 +136,7 @@ static int mount_overlay(struct container *container)
     char options[PATH_MAX * 3];
 
     if (snprintf(options, sizeof(options), "lowerdir=%s,upperdir=%s,workdir=%s",
-                 container->rootfs, container->overlay_upper,
+                 container->config->rootfs, container->overlay_upper,
                  container->overlay_work) >= ( int )sizeof(options)) {
         errno = ENAMETOOLONG;
         return -1;
@@ -279,56 +279,52 @@ static int mount_proc(struct container *container)
 
 static int create_mount_target(const char *target)
 {
-    struct stat st;
+    char  path[PATH_MAX];
+    char *p;
 
-    if (stat(target, &st) == 0) {
-        if (!S_ISDIR(st.st_mode)) {
-            fprintf(stderr, "cage: mount target '%s' is not a directory\n",
-                    target);
-            errno = ENOTDIR;
+    if (strlen(target) >= sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    strcpy(path, target);
+
+    for (p = path + 1; *p != '\0'; ++p) {
+        if (*p != '/')
+            continue;
+
+        *p = '\0';
+
+        if (mkdir(path, 0755) == -1 && errno != EEXIST) {
+            *p = '/';
             return -1;
         }
 
-        return 0;
+        *p = '/';
     }
 
-    if (errno != ENOENT)
-        return -1;
-
-    if (mkdir(target, 0755) == -1)
+    if (mkdir(path, 0755) == -1 && errno != EEXIST)
         return -1;
 
     return 0;
 }
 
-static int mount_configured_mount(const struct mount_config *mount_config)
+static int prepare_mount_targets(const struct container *container)
 {
-    if (create_mount_target(mount_config->target) == -1) {
-        fprintf(stderr, "cage: failed to create mount target '%s': %s\n",
-                mount_config->target, strerror(errno));
-        return -1;
-    }
+    const struct cage_config *config = container->config;
 
-    if (mount(mount_config->source, mount_config->target, NULL,
-              MS_BIND | MS_REC, NULL) == -1) {
-        fprintf(stderr, "cage: failed to mount '%s' on '%s': %s\n",
-                mount_config->source, mount_config->target, strerror(errno));
-        return -1;
-    }
+    for (size_t i = 0; i < config->mount_count; i++) {
+        char target[PATH_MAX];
 
-    if (mount_config->readonly) {
-        if (mount(NULL, mount_config->target, NULL,
-                  MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) == -1) {
-            fprintf(stderr, "cage: failed to make mount '%s' read-only: %s\n",
-                    mount_config->target, strerror(errno));
+        if (snprintf(target, sizeof(target), "%s%s", container->overlay_root,
+                     config->mounts[i].target) >= ( int )sizeof(target)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
 
-            /*
-             * The bind mount was successfully created, so remove it
-             * before reporting failure.
-             */
-            if (umount2(mount_config->target, MNT_DETACH) == -1)
-                perror("umount configured mount");
-
+        if (create_mount_target(target) == -1) {
+            fprintf(stderr, "cage: failed to create mount target '%s': %s\n",
+                    config->mounts[i].target, strerror(errno));
             return -1;
         }
     }
@@ -336,13 +332,37 @@ static int mount_configured_mount(const struct mount_config *mount_config)
     return 0;
 }
 
-static int mount_configured_mounts(const struct cage_config *config)
+static int mount_configured_mounts(const struct container *container)
 {
-    size_t i;
+    const struct cage_config *config = container->config;
 
-    for (i = 0; i < config->mount_count; i++) {
-        if (mount_configured_mount(&config->mounts[i]) == -1)
+    for (size_t i = 0; i < config->mount_count; ++i) {
+        const struct mount_config *mount_config = &config->mounts[i];
+        char                       target[PATH_MAX];
+
+        if (snprintf(target, sizeof(target), "%s%s", container->overlay_root,
+                     mount_config->target) >= ( int )sizeof(target)) {
+            errno = ENAMETOOLONG;
             return -1;
+        }
+
+        if (mount(mount_config->source, target, NULL, MS_BIND | MS_REC, NULL) ==
+            -1) {
+            fprintf(stderr, "cage: failed to mount '%s' on '%s': %s\n",
+                    mount_config->source, mount_config->target,
+                    strerror(errno));
+            return -1;
+        }
+
+        if (mount_config->readonly) {
+            if (mount(NULL, target, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY,
+                      NULL) == -1) {
+                fprintf(stderr,
+                        "cage: failed to make mount '%s' read-only: %s\n",
+                        mount_config->target, strerror(errno));
+                return -1;
+            }
+        }
     }
 
     return 0;
@@ -1114,6 +1134,20 @@ static int child_main(void *arg)
         return 1;
     }
 
+    if (prepare_mount_targets(ctx->container) == -1) {
+        perror("prepare configured mount targets");
+        close(ctx->work_fd);
+        ctx->work_fd = -1;
+        return 1;
+    }
+
+    if (mount_configured_mounts(ctx->container) == -1) {
+        perror("mount configured mounts");
+        close(ctx->work_fd);
+        ctx->work_fd = -1;
+        return 1;
+    }
+
     if (pivot_root_to_overlay(ctx->container) == -1) {
         perror("pivot root");
         close(ctx->work_fd);
@@ -1123,11 +1157,15 @@ static int child_main(void *arg)
 
     if (mount_tmpfs() == -1) {
         perror("mount tmpfs");
+        close(ctx->work_fd);
+        ctx->work_fd = -1;
         return 1;
     }
 
     if (install_command_signal_handlers() == -1) {
         perror("install signal handlers");
+        close(ctx->work_fd);
+        ctx->work_fd = -1;
         return 1;
     }
 

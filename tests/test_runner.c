@@ -2,16 +2,22 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define TEST_ROOTFS_TEMPLATE "/tmp/cage-test-rootfs-XXXXXX"
+#define TEST_CONFIG_TEMPLATE "/tmp/cage-test-config-XXXXXX"
 
 static int tests_run;
 static int tests_failed;
@@ -26,42 +32,21 @@ static void test_fail(const char *name, const char *reason)
 {
     tests_run++;
     tests_failed++;
-
-    fprintf(stderr, "FAIL: %s: %s\n", name, reason);
+    printf("FAIL: %s: %s\n", name, reason);
 }
 
-static int run_cage(const char *cage, const char *rootfs, char *const argv[])
+static int wait_status(pid_t pid)
 {
-    pid_t pid;
-    int   status;
-
-    pid = fork();
-
-    if (pid == -1)
-        return -1;
-
-    if (pid == 0) {
-        char  *args[32];
-        size_t i;
-
-        args[0] = ( char * )cage;
-        args[1] = ( char * )rootfs;
-
-        for (i = 0; argv[i] != NULL; i++)
-            args[i + 2] = argv[i];
-
-        args[i + 2] = NULL;
-
-        execv(cage, args);
-        _exit(127);
-    }
+    int status;
 
     for (;;) {
         if (waitpid(pid, &status, 0) != -1)
             break;
 
-        if (errno != EINTR)
-            return -1;
+        if (errno == EINTR)
+            continue;
+
+        return -1;
     }
 
     if (WIFEXITED(status))
@@ -194,6 +179,124 @@ static void remove_rootfs(const char *rootfs)
     rmdir(rootfs);
 }
 
+static int create_test_config(const char *rootfs, char *config, size_t size)
+{
+    int  fd;
+    int  length;
+    char buffer[PATH_MAX + 32];
+
+    if (strlen(TEST_CONFIG_TEMPLATE) + 1 > size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    strcpy(config, TEST_CONFIG_TEMPLATE);
+
+    fd = mkstemp(config);
+
+    if (fd == -1)
+        return -1;
+
+    length = snprintf(buffer, sizeof(buffer), "rootfs = \"%s\"\n", rootfs);
+
+    if (length < 0 || ( size_t )length >= sizeof(buffer)) {
+        int saved_errno = errno;
+
+        close(fd);
+        unlink(config);
+        errno = saved_errno ? saved_errno : ENAMETOOLONG;
+
+        return -1;
+    }
+
+    {
+        ssize_t written = 0;
+
+        while (written < length) {
+            ssize_t result;
+
+            result = write(fd, buffer + written, ( size_t )(length - written));
+
+            if (result == -1) {
+                if (errno == EINTR)
+                    continue;
+
+                {
+                    int saved_errno = errno;
+
+                    close(fd);
+                    unlink(config);
+                    errno = saved_errno;
+                }
+
+                return -1;
+            }
+
+            written += result;
+        }
+    }
+
+    if (close(fd) == -1) {
+        int saved_errno = errno;
+
+        unlink(config);
+        errno = saved_errno;
+
+        return -1;
+    }
+
+    return 0;
+}
+
+static int create_invalid_rootfs_config(char *config, size_t size)
+{
+    return create_test_config("/tmp/cage-rootfs-does-not-exist", config, size);
+}
+
+static int run_cage(const char *cage, const char *config, char *const argv[])
+{
+    pid_t  pid;
+    size_t argc = 0;
+    size_t i;
+    char **args;
+    int    status;
+
+    while (argv[argc] != NULL)
+        argc++;
+
+    args = calloc(argc + 4, sizeof(*args));
+
+    if (args == NULL)
+        return -1;
+
+    args[0] = ( char * )cage;
+    args[1] = "--config";
+    args[2] = ( char * )config;
+
+    for (i = 0; i < argc; i++)
+        args[i + 3] = argv[i];
+
+    args[argc + 3] = NULL;
+
+    pid            = fork();
+
+    if (pid == -1) {
+        free(args);
+        return -1;
+    }
+
+    if (pid == 0) {
+        execv(cage, args);
+        _exit(127);
+    }
+
+    free(args);
+
+    status = wait_status(pid);
+
+    return status;
+}
+
 static int wait_for_ready(int fd)
 {
     struct pollfd pfd = {
@@ -207,20 +310,22 @@ static int wait_for_ready(int fd)
         int     result;
         ssize_t count;
 
-        do {
-            result = poll(&pfd, 1, 5000);
-        } while (result == -1 && errno == EINTR);
+        result = poll(&pfd, 1, 5000);
 
-        if (result == -1)
+        if (result == -1) {
+            if (errno == EINTR)
+                continue;
+
             return -1;
+        }
 
         if (result == 0) {
             errno = ETIMEDOUT;
             return -1;
         }
 
-        if (pfd.revents & (POLLERR | POLLNVAL)) {
-            errno = EIO;
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            errno = EPIPE;
             return -1;
         }
 
@@ -249,89 +354,95 @@ static int wait_for_ready(int fd)
     return 0;
 }
 
-static int start_cage(const char *cage, const char *rootfs, char *const argv[],
-                      pid_t *pid, int *ready_fd)
+static int start_cage(const char *cage, const char *config, char *const argv[],
+                      pid_t *pid_out, int *ready_fd_out)
 {
-    int   pipe_fds[2];
-    pid_t child;
+    int    pipefd[2];
+    pid_t  pid;
+    size_t argc = 0;
+    size_t i;
+    char **args;
 
-    if (pipe(pipe_fds) == -1)
+    while (argv[argc] != NULL)
+        argc++;
+
+    args = calloc(argc + 4, sizeof(*args));
+
+    if (args == NULL)
         return -1;
 
-    child = fork();
-
-    if (child == -1) {
-        int saved_errno = errno;
-
-        close(pipe_fds[0]);
-        close(pipe_fds[1]);
-
-        errno = saved_errno;
+    if (pipe(pipefd) == -1) {
+        free(args);
         return -1;
     }
 
-    if (child == 0) {
-        char  *args[32];
-        size_t i;
+    args[0] = ( char * )cage;
+    args[1] = "--config";
+    args[2] = ( char * )config;
 
-        close(pipe_fds[0]);
+    for (i = 0; i < argc; i++)
+        args[i + 3] = argv[i];
 
-        if (dup2(pipe_fds[1], STDOUT_FILENO) == -1)
+    args[argc + 3] = NULL;
+
+    pid            = fork();
+
+    if (pid == -1) {
+        int saved_errno = errno;
+
+        close(pipefd[0]);
+        close(pipefd[1]);
+        free(args);
+        errno = saved_errno;
+
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+
+        if (dup2(pipefd[1], STDOUT_FILENO) == -1)
             _exit(127);
 
-        close(pipe_fds[1]);
-
-        args[0] = ( char * )cage;
-        args[1] = ( char * )rootfs;
-
-        for (i = 0; argv[i] != NULL; i++)
-            args[i + 2] = argv[i];
-
-        args[i + 2] = NULL;
+        close(pipefd[1]);
 
         execv(cage, args);
         _exit(127);
     }
 
-    close(pipe_fds[1]);
+    close(pipefd[1]);
+    free(args);
 
-    *pid      = child;
-    *ready_fd = pipe_fds[0];
+    *pid_out      = pid;
+    *ready_fd_out = pipefd[0];
 
     return 0;
 }
 
 static int wait_for_cage_ready(pid_t pid, int ready_fd)
 {
-    int status;
+    int result;
 
-    if (wait_for_ready(ready_fd) == 0) {
-        close(ready_fd);
-        return 0;
-    }
-
+    result = wait_for_ready(ready_fd);
     close(ready_fd);
 
-    if (kill(pid, SIGKILL) == -1 && errno != ESRCH)
+    if (result == -1) {
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
         return -1;
-
-    while (waitpid(pid, &status, 0) == -1) {
-        if (errno != EINTR)
-            return -1;
     }
 
-    errno = ETIMEDOUT;
-    return -1;
+    return 0;
 }
 
 static int find_container_pid(pid_t cage_pid, pid_t *container_pid)
 {
     char    path[PATH_MAX];
-    char    buffer[128];
-    char   *end;
-    long    value;
+    char    buffer[64];
     int     fd;
     ssize_t count;
+    char   *end;
+    long    value;
 
     if (snprintf(path, sizeof(path), "/proc/%ld/task/%ld/children",
                  ( long )cage_pid, ( long )cage_pid) >= ( int )sizeof(path)) {
@@ -346,9 +457,18 @@ static int find_container_pid(pid_t cage_pid, pid_t *container_pid)
 
     count = read(fd, buffer, sizeof(buffer) - 1);
 
+    if (count == -1) {
+        int saved_errno = errno;
+
+        close(fd);
+        errno = saved_errno;
+
+        return -1;
+    }
+
     close(fd);
 
-    if (count <= 0) {
+    if (count == 0) {
         errno = ESRCH;
         return -1;
     }
@@ -389,165 +509,6 @@ static int namespace_differs(pid_t pid, const char *name)
 
     return host_stat.st_dev != container_stat.st_dev ||
            host_stat.st_ino != container_stat.st_ino;
-}
-
-static void test_network_namespace(const char *cage, const char *rootfs)
-{
-    char *argv[] = {
-            "/tests/container_probe",
-            "signal",
-            NULL,
-    };
-    pid_t cage_pid;
-    pid_t container_pid;
-    int   ready_fd;
-    int   isolated;
-    int   status;
-
-    if (start_cage(cage, rootfs, argv, &cage_pid, &ready_fd) == -1) {
-        test_fail("network namespace isolates networking", strerror(errno));
-        return;
-    }
-
-    if (wait_for_cage_ready(cage_pid, ready_fd) == -1) {
-        test_fail("network namespace isolates networking",
-                  "workload did not become ready");
-        return;
-    }
-
-    if (find_container_pid(cage_pid, &container_pid) == -1) {
-        kill(cage_pid, SIGKILL);
-        waitpid(cage_pid, NULL, 0);
-
-        test_fail("network namespace isolates networking",
-                  "could not find container init");
-        return;
-    }
-
-    isolated = namespace_differs(container_pid, "net");
-
-    kill(cage_pid, SIGTERM);
-    waitpid(cage_pid, &status, 0);
-
-    if (isolated == 1) {
-        test_pass("network namespace isolates networking");
-        return;
-    }
-
-    if (isolated == 0) {
-        test_fail("network namespace isolates networking",
-                  "container shares the host network namespace");
-        return;
-    }
-
-    test_fail("network namespace isolates networking",
-              "failed to inspect network namespace");
-}
-
-static void test_exit_status(const char *cage, const char *rootfs)
-{
-    char *argv[] = {
-            "/tests/container_probe",
-            "exit",
-            "42",
-            NULL,
-    };
-    int status;
-
-    status = run_cage(cage, rootfs, argv);
-
-    if (status == 42) {
-        test_pass("command exit status is propagated");
-        return;
-    }
-
-    {
-        char reason[64];
-
-        snprintf(reason, sizeof(reason), "expected 42, got %d", status);
-
-        test_fail("command exit status is propagated", reason);
-    }
-}
-
-static void test_signal_forwarding(const char *cage, const char *rootfs)
-{
-    static const int signals[] = {
-            SIGTERM,
-            SIGINT,
-            SIGHUP,
-            SIGQUIT,
-    };
-    static const char *const names[] = {
-            "SIGTERM",
-            "SIGINT",
-            "SIGHUP",
-            "SIGQUIT",
-    };
-
-    size_t i;
-
-    for (i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
-        char *argv[] = {
-                "/tests/container_probe",
-                "signal",
-                NULL,
-        };
-        pid_t pid;
-        int   ready_fd;
-        int   status;
-        int   expected;
-
-        if (start_cage(cage, rootfs, argv, &pid, &ready_fd) == -1) {
-            test_fail("signals are forwarded to workload", strerror(errno));
-            continue;
-        }
-
-        if (wait_for_cage_ready(pid, ready_fd) == -1) {
-            test_fail("signals are forwarded to workload",
-                      "workload did not become ready");
-            continue;
-        }
-
-        if (kill(pid, signals[i]) == -1) {
-            kill(pid, SIGKILL);
-            waitpid(pid, NULL, 0);
-
-            test_fail("signals are forwarded to workload", strerror(errno));
-            continue;
-        }
-
-        for (;;) {
-            if (waitpid(pid, &status, 0) != -1)
-                break;
-
-            if (errno == EINTR)
-                continue;
-
-            test_fail("signals are forwarded to workload", strerror(errno));
-            break;
-        }
-
-        if (!WIFEXITED(status)) {
-            test_fail("signals are forwarded to workload",
-                      "cage did not exit normally");
-            continue;
-        }
-
-        expected = 128 + signals[i];
-
-        if (WEXITSTATUS(status) != expected) {
-            char reason[128];
-
-            snprintf(reason, sizeof(reason), "%s: expected %d, got %d",
-                     names[i], expected, WEXITSTATUS(status));
-
-            test_fail("signals are forwarded to workload", reason);
-            continue;
-        }
-
-        test_pass(names[i]);
-    }
 }
 
 static int check_id_map(pid_t pid, const char *name, unsigned long host_id)
@@ -604,7 +565,123 @@ static int check_id_map(pid_t pid, const char *name, unsigned long host_id)
     return 1;
 }
 
-static void test_descendant_cleanup(const char *cage, const char *rootfs)
+static int process_exists(pid_t pid)
+{
+    char path[PATH_MAX];
+
+    if (snprintf(path, sizeof(path), "/proc/%ld", ( long )pid) >=
+        ( int )sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if (access(path, F_OK) == 0)
+        return 1;
+
+    if (errno == ENOENT)
+        return 0;
+
+    return -1;
+}
+
+static void test_exit_status(const char *cage, const char *config)
+{
+    char *argv[] = {
+            "/tests/container_probe",
+            "exit",
+            "42",
+            NULL,
+    };
+    int status;
+
+    status = run_cage(cage, config, argv);
+
+    if (status == 42) {
+        test_pass("command exit status is propagated");
+        return;
+    }
+
+    {
+        char reason[64];
+
+        snprintf(reason, sizeof(reason), "expected 42, got %d", status);
+
+        test_fail("command exit status is propagated", reason);
+    }
+}
+
+static void test_signal_forwarding(const char *cage, const char *config)
+{
+    static const int signals[] = {
+            SIGTERM,
+            SIGINT,
+            SIGHUP,
+            SIGQUIT,
+    };
+    static const char *const names[] = {
+            "SIGTERM",
+            "SIGINT",
+            "SIGHUP",
+            "SIGQUIT",
+    };
+
+    size_t i;
+
+    for (i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
+        char *argv[] = {
+                "/tests/container_probe",
+                "signal",
+                NULL,
+        };
+        pid_t pid;
+        int   ready_fd;
+        int   status;
+        int   expected;
+
+        if (start_cage(cage, config, argv, &pid, &ready_fd) == -1) {
+            test_fail("signals are forwarded to workload", strerror(errno));
+            continue;
+        }
+
+        if (wait_for_cage_ready(pid, ready_fd) == -1) {
+            test_fail("signals are forwarded to workload",
+                      "workload did not become ready");
+            continue;
+        }
+
+        if (kill(pid, signals[i]) == -1) {
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
+
+            test_fail("signals are forwarded to workload", strerror(errno));
+            continue;
+        }
+
+        status = wait_status(pid);
+
+        if (status == -1) {
+            test_fail("signals are forwarded to workload", strerror(errno));
+            continue;
+        }
+
+        expected = 128 + signals[i];
+
+        if (status != expected) {
+            char reason[128];
+
+            snprintf(reason, sizeof(reason), "%s: expected %d, got %d",
+                     names[i], expected, status);
+
+            test_fail("signals are forwarded to workload", reason);
+            continue;
+        }
+
+        test_pass(names[i]);
+    }
+}
+
+static void test_descendant_cleanup(const char *cage, const char *config,
+                                    const char *rootfs)
 {
     const char *container_lock_path = "/tests/orphan.lock";
     char        host_lock_path[PATH_MAX];
@@ -631,7 +708,7 @@ static void test_descendant_cleanup(const char *cage, const char *rootfs)
 
     unlink(host_lock_path);
 
-    status = run_cage(cage, rootfs, orphan_argv);
+    status = run_cage(cage, config, orphan_argv);
 
     if (status != 0) {
         char reason[64];
@@ -643,7 +720,7 @@ static void test_descendant_cleanup(const char *cage, const char *rootfs)
         return;
     }
 
-    status = run_cage(cage, rootfs, check_argv);
+    status = run_cage(cage, config, check_argv);
 
     unlink(host_lock_path);
 
@@ -662,7 +739,66 @@ static void test_descendant_cleanup(const char *cage, const char *rootfs)
     }
 }
 
-static void test_pid_namespace(const char *cage, const char *rootfs)
+static void test_descendant_force_cleanup(const char *cage, const char *config,
+                                          const char *rootfs)
+{
+    const char *container_lock_path = "/tests/uncooperative.lock";
+    char        host_lock_path[PATH_MAX];
+    char       *orphan_argv[] = {
+            "/tests/container_probe",
+            "uncooperative-orphan",
+            ( char * )container_lock_path,
+            NULL,
+    };
+    char *check_argv[] = {
+            "/tests/container_probe",
+            "check-lock",
+            ( char * )container_lock_path,
+            NULL,
+    };
+    int status;
+
+    if (snprintf(host_lock_path, sizeof(host_lock_path), "%s%s", rootfs,
+                 container_lock_path) >= ( int )sizeof(host_lock_path)) {
+        test_fail("SIGKILL cleans up uncooperative descendants",
+                  "lock path is too long");
+        return;
+    }
+
+    unlink(host_lock_path);
+
+    status = run_cage(cage, config, orphan_argv);
+
+    if (status != 0) {
+        char reason[64];
+
+        snprintf(reason, sizeof(reason), "orphan test exited with %d", status);
+
+        test_fail("SIGKILL cleans up uncooperative descendants", reason);
+        unlink(host_lock_path);
+        return;
+    }
+
+    status = run_cage(cage, config, check_argv);
+
+    unlink(host_lock_path);
+
+    if (status == 0) {
+        test_pass("SIGKILL cleans up uncooperative descendants");
+        return;
+    }
+
+    {
+        char reason[64];
+
+        snprintf(reason, sizeof(reason),
+                 "lock remained held, check exited with %d", status);
+
+        test_fail("SIGKILL cleans up uncooperative descendants", reason);
+    }
+}
+
+static void test_pid_namespace(const char *cage, const char *config)
 {
     char *argv[] = {
             "/tests/container_probe",
@@ -671,7 +807,7 @@ static void test_pid_namespace(const char *cage, const char *rootfs)
     };
     int status;
 
-    status = run_cage(cage, rootfs, argv);
+    status = run_cage(cage, config, argv);
 
     if (status == 0) {
         test_pass("PID namespace isolates process identity");
@@ -688,7 +824,7 @@ static void test_pid_namespace(const char *cage, const char *rootfs)
     }
 }
 
-static void test_user_namespace(const char *cage, const char *rootfs)
+static void test_user_namespace(const char *cage, const char *config)
 {
     char *argv[] = {
             "/tests/container_probe",
@@ -697,7 +833,7 @@ static void test_user_namespace(const char *cage, const char *rootfs)
     };
     int status;
 
-    status = run_cage(cage, rootfs, argv);
+    status = run_cage(cage, config, argv);
 
     if (status == 0) {
         test_pass("user namespace maps container root");
@@ -714,7 +850,7 @@ static void test_user_namespace(const char *cage, const char *rootfs)
     }
 }
 
-static void test_user_namespace_mapping(const char *cage, const char *rootfs)
+static void test_user_namespace_mapping(const char *cage, const char *config)
 {
     char *argv[] = {
             "/tests/container_probe",
@@ -730,7 +866,7 @@ static void test_user_namespace_mapping(const char *cage, const char *rootfs)
     int   gid_result;
     int   status;
 
-    if (start_cage(cage, rootfs, argv, &cage_pid, &ready_fd) == -1) {
+    if (start_cage(cage, config, argv, &cage_pid, &ready_fd) == -1) {
         test_fail("user namespace maps UID/GID explicitly", strerror(errno));
         return;
     }
@@ -753,8 +889,8 @@ static void test_user_namespace_mapping(const char *cage, const char *rootfs)
     uid        = getuid();
     gid        = getgid();
 
-    uid_result = check_id_map(container_pid, "uid", ( unsigned long )uid);
-    gid_result = check_id_map(container_pid, "gid", ( unsigned long )gid);
+    uid_result = check_id_map(container_pid, "uid", uid);
+    gid_result = check_id_map(container_pid, "gid", gid);
 
     kill(cage_pid, SIGTERM);
     waitpid(cage_pid, &status, 0);
@@ -774,82 +910,7 @@ static void test_user_namespace_mapping(const char *cage, const char *rootfs)
               "failed to inspect UID/GID maps");
 }
 
-static void test_tmpfs_mount(const char *cage, const char *rootfs)
-{
-    char *argv[] = {
-            "/tests/container_probe",
-            "tmpfs",
-            NULL,
-    };
-    int status;
-
-    status = run_cage(cage, rootfs, argv);
-
-    if (status == 0) {
-        test_pass("/tmp is a private writable tmpfs");
-        return;
-    }
-
-    {
-        char reason[64];
-
-        snprintf(reason, sizeof(reason), "expected 0, got %d", status);
-
-        test_fail("/tmp is a private writable tmpfs", reason);
-    }
-}
-
-static void test_proc_mount(const char *cage, const char *rootfs)
-{
-    char *argv[] = {
-            "/tests/container_probe",
-            "proc",
-            NULL,
-    };
-    int status;
-
-    status = run_cage(cage, rootfs, argv);
-
-    if (status == 0) {
-        test_pass("/proc is a proc filesystem");
-        return;
-    }
-
-    {
-        char reason[64];
-
-        snprintf(reason, sizeof(reason), "expected 0, got %d", status);
-
-        test_fail("/proc is a proc filesystem", reason);
-    }
-}
-
-static void test_dev_mount(const char *cage, const char *rootfs)
-{
-    char *argv[] = {
-            "/tests/container_probe",
-            "dev",
-            NULL,
-    };
-    int status;
-
-    status = run_cage(cage, rootfs, argv);
-
-    if (status == 0) {
-        test_pass("/dev is a private tmpfs with device nodes");
-        return;
-    }
-
-    {
-        char reason[64];
-
-        snprintf(reason, sizeof(reason), "expected 0, got %d", status);
-
-        test_fail("/dev is a private tmpfs with device nodes", reason);
-    }
-}
-
-static void test_mount_namespace(const char *cage, const char *rootfs)
+static void test_mount_namespace(const char *cage, const char *config)
 {
     char *argv[] = {
             "/tests/container_probe",
@@ -862,7 +923,7 @@ static void test_mount_namespace(const char *cage, const char *rootfs)
     int   isolated;
     int   status;
 
-    if (start_cage(cage, rootfs, argv, &cage_pid, &ready_fd) == -1) {
+    if (start_cage(cage, config, argv, &cage_pid, &ready_fd) == -1) {
         test_fail("mount namespace isolates mounts", strerror(errno));
         return;
     }
@@ -902,7 +963,82 @@ static void test_mount_namespace(const char *cage, const char *rootfs)
               "failed to inspect mount namespace");
 }
 
-static void test_ipc_namespace(const char *cage, const char *rootfs)
+static void test_tmpfs_mount(const char *cage, const char *config)
+{
+    char *argv[] = {
+            "/tests/container_probe",
+            "tmpfs",
+            NULL,
+    };
+    int status;
+
+    status = run_cage(cage, config, argv);
+
+    if (status == 0) {
+        test_pass("/tmp is a private writable tmpfs");
+        return;
+    }
+
+    {
+        char reason[64];
+
+        snprintf(reason, sizeof(reason), "expected 0, got %d", status);
+
+        test_fail("/tmp is a private writable tmpfs", reason);
+    }
+}
+
+static void test_proc_mount(const char *cage, const char *config)
+{
+    char *argv[] = {
+            "/tests/container_probe",
+            "proc",
+            NULL,
+    };
+    int status;
+
+    status = run_cage(cage, config, argv);
+
+    if (status == 0) {
+        test_pass("/proc is a proc filesystem");
+        return;
+    }
+
+    {
+        char reason[64];
+
+        snprintf(reason, sizeof(reason), "expected 0, got %d", status);
+
+        test_fail("/proc is a proc filesystem", reason);
+    }
+}
+
+static void test_dev_mount(const char *cage, const char *config)
+{
+    char *argv[] = {
+            "/tests/container_probe",
+            "dev",
+            NULL,
+    };
+    int status;
+
+    status = run_cage(cage, config, argv);
+
+    if (status == 0) {
+        test_pass("/dev is a private tmpfs with device nodes");
+        return;
+    }
+
+    {
+        char reason[64];
+
+        snprintf(reason, sizeof(reason), "expected 0, got %d", status);
+
+        test_fail("/dev is a private tmpfs with device nodes", reason);
+    }
+}
+
+static void test_network_namespace(const char *cage, const char *config)
 {
     char *argv[] = {
             "/tests/container_probe",
@@ -915,7 +1051,60 @@ static void test_ipc_namespace(const char *cage, const char *rootfs)
     int   isolated;
     int   status;
 
-    if (start_cage(cage, rootfs, argv, &cage_pid, &ready_fd) == -1) {
+    if (start_cage(cage, config, argv, &cage_pid, &ready_fd) == -1) {
+        test_fail("network namespace isolates networking", strerror(errno));
+        return;
+    }
+
+    if (wait_for_cage_ready(cage_pid, ready_fd) == -1) {
+        test_fail("network namespace isolates networking",
+                  "workload did not become ready");
+        return;
+    }
+
+    if (find_container_pid(cage_pid, &container_pid) == -1) {
+        kill(cage_pid, SIGKILL);
+        waitpid(cage_pid, NULL, 0);
+
+        test_fail("network namespace isolates networking",
+                  "could not find container init");
+        return;
+    }
+
+    isolated = namespace_differs(container_pid, "net");
+
+    kill(cage_pid, SIGTERM);
+    waitpid(cage_pid, &status, 0);
+
+    if (isolated == 1) {
+        test_pass("network namespace isolates networking");
+        return;
+    }
+
+    if (isolated == 0) {
+        test_fail("network namespace isolates networking",
+                  "container shares the host network namespace");
+        return;
+    }
+
+    test_fail("network namespace isolates networking",
+              "failed to inspect network namespace");
+}
+
+static void test_ipc_namespace(const char *cage, const char *config)
+{
+    char *argv[] = {
+            "/tests/container_probe",
+            "signal",
+            NULL,
+    };
+    pid_t cage_pid;
+    pid_t container_pid;
+    int   ready_fd;
+    int   isolated;
+    int   status;
+
+    if (start_cage(cage, config, argv, &cage_pid, &ready_fd) == -1) {
         test_fail("IPC namespace isolates IPC objects", strerror(errno));
         return;
     }
@@ -955,65 +1144,7 @@ static void test_ipc_namespace(const char *cage, const char *rootfs)
               "failed to inspect IPC namespace");
 }
 
-static void test_descendant_force_cleanup(const char *cage, const char *rootfs)
-{
-    const char *container_lock_path = "/tests/uncooperative.lock";
-    char        host_lock_path[PATH_MAX];
-    char       *orphan_argv[] = {
-            "/tests/container_probe",
-            "uncooperative-orphan",
-            ( char * )container_lock_path,
-            NULL,
-    };
-    char *check_argv[] = {
-            "/tests/container_probe",
-            "check-lock",
-            ( char * )container_lock_path,
-            NULL,
-    };
-    int status;
-
-    if (snprintf(host_lock_path, sizeof(host_lock_path), "%s%s", rootfs,
-                 container_lock_path) >= ( int )sizeof(host_lock_path)) {
-        test_fail("SIGKILL cleans up uncooperative descendants",
-                  "lock path is too long");
-        return;
-    }
-
-    unlink(host_lock_path);
-
-    status = run_cage(cage, rootfs, orphan_argv);
-
-    if (status != 0) {
-        char reason[64];
-
-        snprintf(reason, sizeof(reason), "orphan test exited with %d", status);
-
-        test_fail("SIGKILL cleans up uncooperative descendants", reason);
-        unlink(host_lock_path);
-        return;
-    }
-
-    status = run_cage(cage, rootfs, check_argv);
-
-    unlink(host_lock_path);
-
-    if (status == 0) {
-        test_pass("SIGKILL cleans up uncooperative descendants");
-        return;
-    }
-
-    {
-        char reason[64];
-
-        snprintf(reason, sizeof(reason),
-                 "lock remained held, check exited with %d", status);
-
-        test_fail("SIGKILL cleans up uncooperative descendants", reason);
-    }
-}
-
-static void test_capabilities(const char *cage, const char *rootfs)
+static void test_capabilities(const char *cage, const char *config)
 {
     char *argv[] = {
             "/tests/container_probe",
@@ -1022,7 +1153,7 @@ static void test_capabilities(const char *cage, const char *rootfs)
     };
     int status;
 
-    status = run_cage(cage, rootfs, argv);
+    status = run_cage(cage, config, argv);
 
     if (status == 0) {
         test_pass("capabilities are dropped");
@@ -1038,7 +1169,7 @@ static void test_capabilities(const char *cage, const char *rootfs)
     }
 }
 
-static void test_no_new_privs(const char *cage, const char *rootfs)
+static void test_no_new_privs(const char *cage, const char *config)
 {
     char *argv[] = {
             "/tests/container_probe",
@@ -1047,7 +1178,7 @@ static void test_no_new_privs(const char *cage, const char *rootfs)
     };
     int status;
 
-    status = run_cage(cage, rootfs, argv);
+    status = run_cage(cage, config, argv);
 
     if (status == 0) {
         test_pass("no_new_privs is enabled");
@@ -1063,7 +1194,7 @@ static void test_no_new_privs(const char *cage, const char *rootfs)
     }
 }
 
-static void test_fd_inheritance(const char *cage, const char *rootfs)
+static void test_fd_inheritance(const char *cage, const char *config)
 {
     char  fd_string[32];
     char *argv[] = {
@@ -1075,10 +1206,6 @@ static void test_fd_inheritance(const char *cage, const char *rootfs)
     int fd;
     int status;
 
-    /*
-     * Deliberately open a non-CLOEXEC descriptor so that it can only
-     * disappear from the workload if cage explicitly closes it.
-     */
     fd = open("/dev/null", O_RDONLY);
 
     if (fd == -1) {
@@ -1102,7 +1229,7 @@ static void test_fd_inheritance(const char *cage, const char *rootfs)
         return;
     }
 
-    status = run_cage(cage, rootfs, argv);
+    status = run_cage(cage, config, argv);
 
     if (close(fd) == -1) {
         test_fail("internal file descriptors are not inherited",
@@ -1125,27 +1252,7 @@ static void test_fd_inheritance(const char *cage, const char *rootfs)
     }
 }
 
-static void test_invalid_rootfs(const char *cage)
-{
-    char *argv[] = {
-            "/tests/container_probe",
-            "exit",
-            "0",
-            NULL,
-    };
-    int status;
-
-    status = run_cage(cage, "/tmp/cage-rootfs-does-not-exist", argv);
-
-    if (status != 0) {
-        test_pass("invalid rootfs is rejected");
-        return;
-    }
-
-    test_fail("invalid rootfs is rejected", "cage unexpectedly succeeded");
-}
-
-static void test_exec_failure(const char *cage, const char *rootfs)
+static void test_exec_failure(const char *cage, const char *config)
 {
     char *argv[] = {
             "/tests/does-not-exist",
@@ -1153,7 +1260,7 @@ static void test_exec_failure(const char *cage, const char *rootfs)
     };
     int status;
 
-    status = run_cage(cage, rootfs, argv);
+    status = run_cage(cage, config, argv);
 
     if (status == 127) {
         test_pass("exec failure is propagated");
@@ -1169,26 +1276,36 @@ static void test_exec_failure(const char *cage, const char *rootfs)
     }
 }
 
-static int process_exists(pid_t pid)
+static void test_invalid_rootfs(const char *cage)
 {
-    char path[PATH_MAX];
+    char  config[PATH_MAX];
+    char *argv[] = {
+            "/tests/container_probe",
+            "exit",
+            "0",
+            NULL,
+    };
+    int status;
 
-    if (snprintf(path, sizeof(path), "/proc/%ld", ( long )pid) >=
-        ( int )sizeof(path)) {
-        errno = ENAMETOOLONG;
-        return -1;
+    if (create_invalid_rootfs_config(config, sizeof(config)) == -1) {
+        test_fail("invalid rootfs is rejected",
+                  "failed to create invalid test config");
+        return;
     }
 
-    if (access(path, F_OK) == 0)
-        return 1;
+    status = run_cage(cage, config, argv);
 
-    if (errno == ENOENT)
-        return 0;
+    unlink(config);
 
-    return -1;
+    if (status != 0) {
+        test_pass("invalid rootfs is rejected");
+        return;
+    }
+
+    test_fail("invalid rootfs is rejected", "cage unexpectedly succeeded");
 }
 
-static void test_parent_death(const char *cage, const char *rootfs)
+static void test_parent_death(const char *cage, const char *config)
 {
     char *argv[] = {
             "/tests/container_probe",
@@ -1201,7 +1318,7 @@ static void test_parent_death(const char *cage, const char *rootfs)
     int   status;
     int   result;
 
-    if (start_cage(cage, rootfs, argv, &cage_pid, &ready_fd) == -1) {
+    if (start_cage(cage, config, argv, &cage_pid, &ready_fd) == -1) {
         test_fail("container dies when cage supervisor dies", strerror(errno));
         return;
     }
@@ -1285,6 +1402,7 @@ static void test_parent_death(const char *cage, const char *rootfs)
 int main(int argc, char **argv)
 {
     char rootfs[PATH_MAX];
+    char config[PATH_MAX];
 
     if (argc != 3) {
         fprintf(stderr, "usage: %s <cage> <container_probe>\n", argv[0]);
@@ -1296,26 +1414,33 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    test_exit_status(argv[1], rootfs);
-    test_signal_forwarding(argv[1], rootfs);
-    test_descendant_cleanup(argv[1], rootfs);
-    test_descendant_force_cleanup(argv[1], rootfs);
-    test_pid_namespace(argv[1], rootfs);
-    test_user_namespace(argv[1], rootfs);
-    test_user_namespace_mapping(argv[1], rootfs);
-    test_mount_namespace(argv[1], rootfs);
-    test_tmpfs_mount(argv[1], rootfs);
-    test_proc_mount(argv[1], rootfs);
-    test_dev_mount(argv[1], rootfs);
-    test_network_namespace(argv[1], rootfs);
-    test_ipc_namespace(argv[1], rootfs);
-    test_capabilities(argv[1], rootfs);
-    test_no_new_privs(argv[1], rootfs);
-    test_fd_inheritance(argv[1], rootfs);
-    test_exec_failure(argv[1], rootfs);
-    test_invalid_rootfs(argv[1]);
-    test_parent_death(argv[1], rootfs);
+    if (create_test_config(rootfs, config, sizeof(config)) == -1) {
+        perror("create test config");
+        remove_rootfs(rootfs);
+        return EXIT_FAILURE;
+    }
 
+    test_exit_status(argv[1], config);
+    test_signal_forwarding(argv[1], config);
+    test_descendant_cleanup(argv[1], config, rootfs);
+    test_descendant_force_cleanup(argv[1], config, rootfs);
+    test_pid_namespace(argv[1], config);
+    test_user_namespace(argv[1], config);
+    test_user_namespace_mapping(argv[1], config);
+    test_mount_namespace(argv[1], config);
+    test_tmpfs_mount(argv[1], config);
+    test_proc_mount(argv[1], config);
+    test_dev_mount(argv[1], config);
+    test_network_namespace(argv[1], config);
+    test_ipc_namespace(argv[1], config);
+    test_capabilities(argv[1], config);
+    test_no_new_privs(argv[1], config);
+    test_fd_inheritance(argv[1], config);
+    test_exec_failure(argv[1], config);
+    test_invalid_rootfs(argv[1]);
+    test_parent_death(argv[1], config);
+
+    unlink(config);
     remove_rootfs(rootfs);
 
     printf("\n%d tests, %d failures\n", tests_run, tests_failed);
