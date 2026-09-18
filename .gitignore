@@ -12,3 +12,7 @@ rootfs/
 # Test Binaries
 tests/test_runner
 tests/container_probe
+
+# Demo
+demo.cast
+demo.gif
