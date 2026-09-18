@@ -24,9 +24,9 @@ static int validate_rootfs(const char *rootfs)
     return 0;
 }
 
-static void usage(const char *program)
+static void usage(void)
 {
-    fprintf(stderr, "usage: %s <rootfs> <command> [args...]\n", program);
+    fprintf(stderr, "usage: cage <rootfs> <command> [args...]\n");
 }
 
 int main(int argc, char **argv)
@@ -35,7 +35,7 @@ int main(int argc, char **argv)
     int              status;
 
     if (argc < 3) {
-        usage(argv[0]);
+        usage();
         return EXIT_FAILURE;
     }
 
@@ -43,9 +43,15 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
 
     container = (struct container){
-            .rootfs = argv[1],
-            .argv   = &argv[2],
-            .pid    = -1,
+            .rootfs           = argv[1],
+            .argv             = &argv[2],
+            .pid              = -1,
+            .private_dir      = {0},
+            .overlay_upper    = {0},
+            .overlay_work     = {0},
+            .overlay_root     = {0},
+            .overlay_old_root = {0},
+            .private_dir_fd   = -1,
     };
 
     status = container_run(&container);
