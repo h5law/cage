@@ -2124,6 +2124,58 @@ static int test_duplicate_config_argument(void)
     return 0;
 }
 
+static int test_process_state(void)
+{
+    test_begin("command process state is sanitised");
+
+    char config[PATH_MAX];
+    char rootfs[PATH_MAX];
+
+    if (prepare_rootfs_and_config(rootfs, sizeof(rootfs), config,
+                                  sizeof(config)) < 0) {
+        test_fail("failed to prepare test rootfs");
+        return -1;
+    }
+
+    struct {
+        const char *probe;
+        const char *description;
+    } probes[] = {
+            {"cwd",                 "working directory"  },
+            {"umask",               "umask"              },
+            {"signal-mask",         "signal mask"        },
+            {"signal-dispositions", "signal dispositions"},
+    };
+
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); ++i) {
+        char *argv[] = {
+                ( char * )cage_path,    ( char * )"--config",      config,
+                ( char * )"/bin/probe", ( char * )probes[i].probe, NULL,
+        };
+
+        int status = run_process(argv);
+
+        if (status != 0) {
+            unlink(config);
+            remove_tree(rootfs);
+
+            char message[128];
+
+            snprintf(message, sizeof(message), "inherited %s was not sanitised",
+                     probes[i].description);
+
+            test_fail(message);
+            return -1;
+        }
+    }
+
+    unlink(config);
+    remove_tree(rootfs);
+
+    test_pass();
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 3) {
@@ -2156,6 +2208,8 @@ int main(int argc, char **argv)
     test_capabilities();
     test_no_new_privs();
     test_fd_inheritance();
+    test_process_state();
+    test_exec_failure();
     test_exec_failure();
     test_invalid_rootfs();
     test_parent_death();

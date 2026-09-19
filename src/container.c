@@ -1068,6 +1068,38 @@ static int wait_for_command(pid_t command, int *command_status)
     }
 }
 
+static int reset_command_process_state(void)
+{
+    sigset_t set;
+
+    /*
+     * The supervisor blocks signals while establishing the container.
+     * Do not leak that signal mask into the workload.
+     */
+    sigfillset(&set);
+
+    if (sigprocmask(SIG_UNBLOCK, &set, NULL) == -1)
+        return -1;
+
+    /*
+     * Do not inherit the supervisor's umask.
+     */
+    umask(022);
+
+    /*
+     * Commands always start from the container root.
+     */
+    if (chdir("/") == -1)
+        return -1;
+
+    /*
+     * Do not inherit cage-init's signal dispositions.
+     */
+    reset_signal_handlers();
+
+    return 0;
+}
+
 static int run_command(struct child_context *ctx)
 {
     pid_t pid;
@@ -1085,7 +1117,8 @@ static int run_command(struct child_context *ctx)
     }
 
     if (pid == 0) {
-        reset_signal_handlers();
+        if (reset_command_process_state() == -1)
+            _exit(127);
 
         if (drop_capabilities() == -1)
             _exit(127);
@@ -1099,9 +1132,6 @@ static int run_command(struct child_context *ctx)
          * are deliberately preserved.
          */
         if (close_inherited_fds() == -1)
-            _exit(127);
-
-        if (unblock_forwarded_signals() == -1)
             _exit(127);
 
         /*

@@ -88,6 +88,76 @@ static int probe_exit(const char *arg)
     return ( int )status;
 }
 
+static int probe_cwd(void)
+{
+    char cwd[PATH_MAX];
+
+    if (getcwd(cwd, sizeof(cwd)) == NULL)
+        return 1;
+
+    return strcmp(cwd, "/") == 0 ? 0 : 1;
+}
+
+static int probe_umask(void)
+{
+    mode_t current;
+
+    current = umask(022);
+    umask(current);
+
+    return current == 022 ? 0 : 1;
+}
+
+static int probe_signal_mask(void)
+{
+    sigset_t set;
+
+    if (sigprocmask(SIG_SETMASK, NULL, &set) == -1)
+        return 1;
+
+    if (sigismember(&set, SIGTERM) == 1)
+        return 1;
+
+    if (sigismember(&set, SIGINT) == 1)
+        return 1;
+
+    if (sigismember(&set, SIGHUP) == 1)
+        return 1;
+
+    if (sigismember(&set, SIGQUIT) == 1)
+        return 1;
+
+    return 0;
+}
+
+static int probe_signal_dispositions(void)
+{
+    struct sigaction action;
+
+    if (sigaction(SIGTERM, NULL, &action) == -1)
+        return 1;
+
+    if (action.sa_handler != SIG_DFL)
+        return 1;
+
+    if (sigaction(SIGINT, NULL, &action) == -1)
+        return 1;
+
+    if (action.sa_handler != SIG_DFL)
+        return 1;
+
+    if (sigaction(SIGHUP, NULL, &action) == -1)
+        return 1;
+
+    if (action.sa_handler != SIG_DFL)
+        return 1;
+
+    if (sigaction(SIGQUIT, NULL, &action) == -1)
+        return 1;
+
+    return action.sa_handler == SIG_DFL ? 0 : 1;
+}
+
 static int probe_signal(const char *arg)
 {
     char *end;
@@ -498,6 +568,18 @@ int main(int argc, char **argv)
 
         return probe_namespace(argv[2], dev, ino) ? 1 : 0;
     }
+
+    if (strcmp(argv[1], "cwd") == 0)
+        return probe_cwd();
+
+    if (strcmp(argv[1], "umask") == 0)
+        return probe_umask();
+
+    if (strcmp(argv[1], "signal-mask") == 0)
+        return probe_signal_mask();
+
+    if (strcmp(argv[1], "signal-dispositions") == 0)
+        return probe_signal_dispositions();
 
     if (strcmp(argv[1], "signal") == 0) {
         if (argc != 3)
