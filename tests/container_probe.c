@@ -7,11 +7,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+static int probe_success(void) { return 0; }
 
 static int write_all(int fd, const char *buf, size_t len)
 {
@@ -83,6 +86,76 @@ static int probe_exit(const char *arg)
         return 1;
 
     return ( int )status;
+}
+
+static int probe_cwd(void)
+{
+    char cwd[PATH_MAX];
+
+    if (getcwd(cwd, sizeof(cwd)) == NULL)
+        return 1;
+
+    return strcmp(cwd, "/") == 0 ? 0 : 1;
+}
+
+static int probe_umask(void)
+{
+    mode_t current;
+
+    current = umask(022);
+    umask(current);
+
+    return current == 022 ? 0 : 1;
+}
+
+static int probe_signal_mask(void)
+{
+    sigset_t set;
+
+    if (sigprocmask(SIG_SETMASK, NULL, &set) == -1)
+        return 1;
+
+    if (sigismember(&set, SIGTERM) == 1)
+        return 1;
+
+    if (sigismember(&set, SIGINT) == 1)
+        return 1;
+
+    if (sigismember(&set, SIGHUP) == 1)
+        return 1;
+
+    if (sigismember(&set, SIGQUIT) == 1)
+        return 1;
+
+    return 0;
+}
+
+static int probe_signal_dispositions(void)
+{
+    struct sigaction action;
+
+    if (sigaction(SIGTERM, NULL, &action) == -1)
+        return 1;
+
+    if (action.sa_handler != SIG_DFL)
+        return 1;
+
+    if (sigaction(SIGINT, NULL, &action) == -1)
+        return 1;
+
+    if (action.sa_handler != SIG_DFL)
+        return 1;
+
+    if (sigaction(SIGHUP, NULL, &action) == -1)
+        return 1;
+
+    if (action.sa_handler != SIG_DFL)
+        return 1;
+
+    if (sigaction(SIGQUIT, NULL, &action) == -1)
+        return 1;
+
+    return action.sa_handler == SIG_DFL ? 0 : 1;
 }
 
 static int probe_signal(const char *arg)
@@ -225,6 +298,29 @@ static int probe_orphan(int uncooperative)
     return 0;
 }
 
+static int probe_orphan_hold(const char *path)
+{
+    pid_t pid = fork();
+
+    if (pid == -1)
+        return 1;
+
+    if (pid == 0) {
+        int fd = open(path, O_RDWR | O_CREAT, 0644);
+
+        if (fd == -1)
+            _exit(1);
+
+        if (flock(fd, LOCK_EX) == -1)
+            _exit(1);
+
+        for (;;)
+            pause();
+    }
+
+    return 0;
+}
+
 static int probe_check_lock(const char *path)
 {
     int fd = open(path, O_RDWR | O_CREAT, 0644);
@@ -239,6 +335,58 @@ static int probe_check_lock(const char *path)
 
     close(fd);
     return 0;
+}
+
+static int probe_hold(const char *path)
+{
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+
+    if (fd == -1)
+        return 1;
+
+    if (flock(fd, LOCK_EX) == -1) {
+        close(fd);
+        return 1;
+    }
+
+    for (;;)
+        pause();
+}
+
+static int probe_hold_kill(const char *path)
+{
+    char marker[PATH_MAX];
+    int  fd;
+
+    if (snprintf(marker, sizeof(marker), "%s.started", path) >=
+        ( int )sizeof(marker))
+        return 1;
+
+    fd = open(path, O_RDWR | O_CREAT, 0644);
+
+    if (fd == -1)
+        return 1;
+
+    if (flock(fd, LOCK_EX) == -1) {
+        close(fd);
+        return 1;
+    }
+
+    int marker_fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    if (marker_fd == -1) {
+        close(fd);
+        return 1;
+    }
+
+    close(marker_fd);
+
+    usleep(500000);
+
+    kill(getpid(), SIGKILL);
+
+    close(fd);
+    return 1;
 }
 
 static int probe_pid(void)
@@ -283,12 +431,68 @@ static int probe_dev(const char *path)
     return S_ISCHR(st.st_mode) ? 0 : 1;
 }
 
+static int probe_mount_private(const char *target)
+{
+    FILE *fp;
+    char  line[8192];
+
+    fp = fopen("/proc/self/mountinfo", "r");
+
+    if (fp == NULL)
+        return 1;
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *separator;
+        char *mount_point;
+        char *optional;
+
+        separator = strstr(line, " - ");
+
+        if (separator == NULL)
+            continue;
+
+        *separator = '\0';
+
+        char *saveptr;
+        char *field = strtok_r(line, " ", &saveptr);
+
+        for (int i = 0; field != NULL && i < 4; ++i)
+            field = strtok_r(NULL, " ", &saveptr);
+
+        if (field == NULL)
+            continue;
+
+        mount_point = field;
+
+        if (strcmp(mount_point, target) != 0)
+            continue;
+
+        optional = strtok_r(NULL, " ", &saveptr);
+
+        while (optional != NULL) {
+            if (strncmp(optional, "shared:", 7) == 0) {
+                fclose(fp);
+                return 1;
+            }
+
+            optional = strtok_r(NULL, " ", &saveptr);
+        }
+
+        fclose(fp);
+        return 0;
+    }
+
+    fclose(fp);
+    return 1;
+}
+
 static int probe_capabilities(void)
 {
     FILE *fp;
     char  buf[4096];
 
     fp = fopen("/proc/self/status", "r");
+
     if (fp == NULL)
         return 1;
 
@@ -348,6 +552,7 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "exit") == 0) {
         if (argc != 3)
             return 1;
+
         return probe_exit(argv[2]);
     }
 
@@ -364,9 +569,22 @@ int main(int argc, char **argv)
         return probe_namespace(argv[2], dev, ino) ? 1 : 0;
     }
 
+    if (strcmp(argv[1], "cwd") == 0)
+        return probe_cwd();
+
+    if (strcmp(argv[1], "umask") == 0)
+        return probe_umask();
+
+    if (strcmp(argv[1], "signal-mask") == 0)
+        return probe_signal_mask();
+
+    if (strcmp(argv[1], "signal-dispositions") == 0)
+        return probe_signal_dispositions();
+
     if (strcmp(argv[1], "signal") == 0) {
         if (argc != 3)
             return 1;
+
         return probe_signal(argv[2]);
     }
 
@@ -386,7 +604,36 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "check-lock") == 0) {
         if (argc != 3)
             return 1;
+
         return probe_check_lock(argv[2]);
+    }
+
+    if (strcmp(argv[1], "hold") == 0) {
+        if (argc != 3)
+            return 1;
+
+        return probe_hold(argv[2]);
+    }
+
+    if (strcmp(argv[1], "hold-kill") == 0) {
+        if (argc != 3)
+            return 1;
+
+        return probe_hold_kill(argv[2]);
+    }
+
+    if (strcmp(argv[1], "orphan-hold") == 0) {
+        if (argc != 3)
+            return 1;
+
+        return probe_orphan_hold(argv[2]);
+    }
+
+    if (strcmp(argv[1], "success") == 0) {
+        if (argc != 2)
+            return 1;
+
+        return probe_success();
     }
 
     if (strcmp(argv[1], "pid") == 0)
@@ -406,19 +653,29 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "tmpfs") == 0) {
         if (argc != 3)
             return 1;
+
         return probe_tmpfs(argv[2]);
     }
 
     if (strcmp(argv[1], "proc") == 0) {
         if (argc != 3)
             return 1;
+
         return probe_proc(argv[2]);
     }
 
     if (strcmp(argv[1], "dev") == 0) {
         if (argc != 3)
             return 1;
+
         return probe_dev(argv[2]);
+    }
+
+    if (strcmp(argv[1], "mount-private") == 0) {
+        if (argc != 3)
+            return 1;
+
+        return probe_mount_private(argv[2]);
     }
 
     if (strcmp(argv[1], "capabilities") == 0)
@@ -433,12 +690,14 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "write-file") == 0) {
         if (argc != 4)
             return 1;
+
         return probe_write_file(argv[2], argv[3]);
     }
 
     if (strcmp(argv[1], "read-file") == 0) {
         if (argc != 4)
             return 1;
+
         return probe_read_file(argv[2], argv[3]);
     }
 

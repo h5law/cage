@@ -116,15 +116,15 @@ Move runtime configuration out of positional CLI arguments and into a configurat
 
 ### Testing
 
-* [ ] Add configuration parser regression tests
-* [ ] Test missing configuration files
-* [ ] Test malformed configuration
-* [ ] Test invalid rootfs configuration
-* [ ] Test invalid mount configuration
-* [ ] Test configured writable mounts
-* [ ] Test configured read-only mounts
-* [ ] Test configured mounts survive container teardown
-* [ ] Audit configured-mount failure cleanup
+* [x] Add configuration parser property tests
+* [x] Test missing configuration files
+* [x] Test malformed configuration
+* [x] Test invalid rootfs configuration
+* [x] Test invalid mount configuration
+* [x] Test configured writable mounts
+* [x] Test configured read-only mounts
+* [x] Test configured mounts survive container teardown
+* [x] Audit configured-mount failure cleanup
 
 ### Documentation
 
@@ -150,37 +150,135 @@ Make container setup and teardown robust against failures and hostile conditions
 
 ### Filesystem and runtime hardening
 
+* [x] Add property-based security testing
+* [x] Exercise filesystem path traversal and escape surfaces
+* [x] Exercise procfs and sysfs access surfaces
+* [x] Exercise namespace-related escape surfaces
+* [x] Exercise mount and mount-namespace operations
+* [x] Exercise device access surfaces
+* [x] Exercise capability and privilege-related operations
+* [x] Exercise process-control surfaces such as `ptrace` and `kill`
 * [ ] Restrict remaining filesystem/device access further
 * [ ] Review namespace-specific privilege boundaries
-* [ ] Audit inherited process state
-* [ ] Audit signal-handling edge cases
-* [ ] Audit mount propagation behaviour
-* [ ] Verify no host mounts are unintentionally exposed
-* [ ] Verify configured read-only mounts cannot be written from the container
+* [x] Audit inherited process state
+* [x] Audit signal-handling edge cases
+* [x] Audit mount propagation behaviour
+* [x] Verify no host mounts are unintentionally exposed
+* [x] Verify configured read-only mounts cannot be written from the container
+
+### Process lifecycle
+
+* [x] Ensure container PID 1 reaps descendants
+* [x] Terminate remaining descendants during teardown
+* [x] Force-kill descendants after the termination grace period
+* [x] Verify orphaned descendants cannot survive container teardown
+* [x] Verify cleanup after abnormal child termination
 
 ### Failure handling
 
 * [ ] Handle missing OverlayFS support
 * [ ] Handle unusable rootfs permissions
-* [ ] Handle failure during mount setup
-* [ ] Handle failure during `pivot_root`
-* [ ] Handle failure during `/dev` setup
-* [ ] Handle failure during `/proc` setup
-* [ ] Handle failure during configured mount setup
-* [ ] Verify cleanup after every setup failure
-* [ ] Verify no runtime-directory leaks
-* [ ] Verify no mount leaks
-* [ ] Verify no child-process leaks
+* [x] Handle failure during mount setup
+* [x] Handle failure during `pivot_root`
+* [x] Handle failure during `/dev` setup
+* [x] Handle failure during `/proc` setup
+* [x] Handle failure during configured mount setup
+* [x] Verify cleanup after every setup failure
+* [x] Verify no runtime-directory leaks
+* [x] Verify no mount leaks
+* [x] Verify no child-process leaks
 
-### Regression tests
+### Process-state sanitisation
 
-* [ ] Add hardening regression tests where appropriate
-* [ ] Add failure-path regression tests
-* [ ] Add teardown regression tests
-* [ ] Verify repeated container creation and teardown
-* [ ] Verify abnormal child termination is cleaned up correctly
+* [x] Reset inherited signal dispositions
+* [x] Reset inherited signal mask
+* [x] Establish a deterministic default umask
+* [x] Establish a deterministic initial working directory
+* [x] Sanitize inherited environment
+* [x] Verify command process state through regression probes
 
-## Milestone 6 — Review & Release
+### Regression & property testing
+
+* [x] Add configuration property tests
+* [x] Add configuration formatting-invariance tests
+* [x] Add configuration invalid-input tests
+* [x] Add configuration whitespace tests
+* [x] Add configuration literal-value tests
+* [x] Add property-based escape testing
+* [x] Add generated path traversal coverage
+* [x] Add generated namespace and proc/sys path coverage
+* [x] Add timeout handling for hostile or hanging security probes
+* [x] Add configured mount failure cleanup regression test
+* [x] Add hardening regression tests where appropriate
+* [x] Add failure-path regression tests
+* [x] Add teardown regression tests
+* [x] Verify repeated container creation and teardown
+* [x] Verify abnormal child termination is cleaned up correctly
+
+## Milestone 6 — Resource & Lifecycle Hardening
+
+Add explicit resource controls and harden the runtime against resource exhaustion and lifecycle races.
+
+### Resource limits
+
+* [ ] Define resource-limit configuration
+* [ ] Implement `RLIMIT_NOFILE`
+* [ ] Implement `RLIMIT_NPROC`
+* [ ] Implement `RLIMIT_CORE`
+* [ ] Validate configured resource limits
+* [ ] Apply resource limits inside the container
+* [ ] Test configured resource limits
+* [ ] Test invalid resource-limit configuration
+* [ ] Verify limits cannot be relaxed by the workload
+
+### Lifecycle races
+
+* [ ] Test termination during namespace setup
+* [ ] Test termination during filesystem setup
+* [ ] Test termination during `pivot_root`
+* [ ] Test termination during `/proc` setup
+* [ ] Test termination during `/dev` setup
+* [ ] Test termination during configured mount setup
+* [ ] Test termination immediately after command startup
+* [ ] Test repeated termination signals
+* [ ] Test parent death during container setup
+* [ ] Test parent death during container teardown
+* [ ] Verify all lifecycle races leave no leaked resources
+
+### Filesystem and mount hardening
+
+* [ ] Reject unsafe mount sources
+* [ ] Reject unsafe mount targets
+* [ ] Reject duplicate or conflicting mounts
+* [ ] Verify configured mounts cannot escape the container namespace
+* [ ] Verify mount propagation remains private
+* [ ] Audit mount flags and permissions
+* [ ] Audit OverlayFS mount options
+* [ ] Handle missing OverlayFS support cleanly
+* [ ] Handle unusable rootfs permissions cleanly
+
+### Stress testing
+
+* [ ] Run repeated container creation and teardown under load
+* [ ] Stress short-lived container processes
+* [ ] Stress descendant process creation
+* [ ] Stress descriptor limits
+* [ ] Stress mount setup and teardown
+* [ ] Stress abnormal process termination
+* [ ] Verify no process leaks under stress
+* [ ] Verify no mount leaks under stress
+* [ ] Verify no runtime-directory leaks under stress
+
+### Resource ownership
+
+* [ ] Audit every file-descriptor ownership path
+* [ ] Audit every mount ownership path
+* [ ] Audit runtime-directory ownership
+* [ ] Audit configuration ownership
+* [ ] Audit child-process ownership
+* [ ] Verify every failure path has a single cleanup owner
+
+## Milestone 7 — Review & Release
 
 Bring the implementation and documentation into a coherent first release.
 
@@ -195,6 +293,8 @@ Bring the implementation and documentation into a coherent first release.
 * [ ] Review public headers
 * [ ] Review compiler warnings
 * [ ] Review static-analysis findings
+* [ ] Review undefined-behaviour findings
+* [ ] Review security-sensitive system-call usage
 
 ### Testing
 
@@ -202,9 +302,13 @@ Bring the implementation and documentation into a coherent first release.
 * [ ] Run tests from a clean build
 * [ ] Verify tests do not depend on the developer's environment
 * [ ] Verify temporary files and mounts are cleaned up
-* [ ] Verify configured mounts behave as documented
+* [x] Verify configured mounts behave as documented
 * [ ] Verify supplied rootfs remains unchanged
 * [ ] Verify ordinary container changes are ephemeral
+* [ ] Run resource-limit tests
+* [ ] Run lifecycle-race tests
+* [ ] Run stress tests
+* [ ] Run the complete regression suite repeatedly
 
 ### Documentation
 
@@ -216,12 +320,15 @@ Bring the implementation and documentation into a coherent first release.
 * [x] Document security model and limitations
 * [x] Document project structure
 * [x] Document build and test commands
+* [ ] Document resource limits
+* [ ] Document resource exhaustion behaviour
+* [ ] Document lifecycle and teardown guarantees
 * [ ] Review documentation against final implementation
 
 ### Release
 
 * [ ] Finalise commit history
 * [ ] Prepare final pull request
-* [ ] Review and merge Milestone 6
+* [ ] Review and merge Milestone 7
 * [ ] Create first release tag
 * [ ] Publish first release

@@ -14,6 +14,17 @@ rootfs/
 tests/test_runner
 tests/container_probe
 tests/test_config
+tests/escape/escape_probe
+tests/escape/escape_runner
+tests/property/test_config_format_property
+tests/property/test_config_hash_property
+tests/property/test_config_invalid_property
+tests/property/test_config_property
+tests/property/test_config_whitespace_property
+tests/property/test_escape_property
+
+# Vendor
+vendor/
 
 # Demo
 demo.cast
