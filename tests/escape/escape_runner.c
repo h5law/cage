@@ -183,7 +183,7 @@ static int test_proc_root_openat(void)
     }
 
     argv[0] = ( char * )"/bin/escape-probe";
-    argv[1] = ( char * )"openat-traversal";
+    argv[1] = ( char * )"proc-root-openat";
     argv[2] = canary;
     argv[3] = ( char * )canary_contents;
     argv[4] = NULL;
