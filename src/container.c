@@ -1,4 +1,5 @@
-#include "container.h"
+#include <container.h>
+#include <config.h>
 
 #include <dirent.h>
 #include <errno.h>
@@ -135,7 +136,7 @@ static int mount_overlay(struct container *container)
     char options[PATH_MAX * 3];
 
     if (snprintf(options, sizeof(options), "lowerdir=%s,upperdir=%s,workdir=%s",
-                 container->rootfs, container->overlay_upper,
+                 container->config->rootfs, container->overlay_upper,
                  container->overlay_work) >= ( int )sizeof(options)) {
         errno = ENAMETOOLONG;
         return -1;
@@ -272,6 +273,97 @@ static int mount_proc(struct container *container)
     if (mount("proc", proc_path, "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV,
               "subset=pid") == -1)
         return -1;
+
+    return 0;
+}
+
+static int create_mount_target(const char *target)
+{
+    char  path[PATH_MAX];
+    char *p;
+
+    if (strlen(target) >= sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    strcpy(path, target);
+
+    for (p = path + 1; *p != '\0'; ++p) {
+        if (*p != '/')
+            continue;
+
+        *p = '\0';
+
+        if (mkdir(path, 0755) == -1 && errno != EEXIST) {
+            *p = '/';
+            return -1;
+        }
+
+        *p = '/';
+    }
+
+    if (mkdir(path, 0755) == -1 && errno != EEXIST)
+        return -1;
+
+    return 0;
+}
+
+static int prepare_mount_targets(const struct container *container)
+{
+    const struct cage_config *config = container->config;
+
+    for (size_t i = 0; i < config->mount_count; i++) {
+        char target[PATH_MAX];
+
+        if (snprintf(target, sizeof(target), "%s%s", container->overlay_root,
+                     config->mounts[i].target) >= ( int )sizeof(target)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+
+        if (create_mount_target(target) == -1) {
+            fprintf(stderr, "cage: failed to create mount target '%s': %s\n",
+                    config->mounts[i].target, strerror(errno));
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int mount_configured_mounts(const struct container *container)
+{
+    const struct cage_config *config = container->config;
+
+    for (size_t i = 0; i < config->mount_count; ++i) {
+        const struct mount_config *mount_config = &config->mounts[i];
+        char                       target[PATH_MAX];
+
+        if (snprintf(target, sizeof(target), "%s%s", container->overlay_root,
+                     mount_config->target) >= ( int )sizeof(target)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+
+        if (mount(mount_config->source, target, NULL, MS_BIND | MS_REC, NULL) ==
+            -1) {
+            fprintf(stderr, "cage: failed to mount '%s' on '%s': %s\n",
+                    mount_config->source, mount_config->target,
+                    strerror(errno));
+            return -1;
+        }
+
+        if (mount_config->readonly) {
+            if (mount(NULL, target, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY,
+                      NULL) == -1) {
+                fprintf(stderr,
+                        "cage: failed to make mount '%s' read-only: %s\n",
+                        mount_config->target, strerror(errno));
+                return -1;
+            }
+        }
+    }
 
     return 0;
 }
@@ -1042,6 +1134,20 @@ static int child_main(void *arg)
         return 1;
     }
 
+    if (prepare_mount_targets(ctx->container) == -1) {
+        perror("prepare configured mount targets");
+        close(ctx->work_fd);
+        ctx->work_fd = -1;
+        return 1;
+    }
+
+    if (mount_configured_mounts(ctx->container) == -1) {
+        perror("mount configured mounts");
+        close(ctx->work_fd);
+        ctx->work_fd = -1;
+        return 1;
+    }
+
     if (pivot_root_to_overlay(ctx->container) == -1) {
         perror("pivot root");
         close(ctx->work_fd);
@@ -1051,11 +1157,15 @@ static int child_main(void *arg)
 
     if (mount_tmpfs() == -1) {
         perror("mount tmpfs");
+        close(ctx->work_fd);
+        ctx->work_fd = -1;
         return 1;
     }
 
     if (install_command_signal_handlers() == -1) {
         perror("install signal handlers");
+        close(ctx->work_fd);
+        ctx->work_fd = -1;
         return 1;
     }
 
@@ -1176,7 +1286,7 @@ int container_run(struct container *container)
     char                 ready;
     int                  handlers_installed;
 
-    if (container == NULL || container->rootfs == NULL ||
+    if (container == NULL || container->config->rootfs == NULL ||
         container->argv == NULL || container->argv[0] == NULL) {
         errno = EINVAL;
         return -1;

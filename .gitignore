@@ -1,5 +1,6 @@
 # Binary
 cage
+cage.toml
 
 # Outputs
 */*.o
@@ -12,6 +13,7 @@ rootfs/
 # Test Binaries
 tests/test_runner
 tests/container_probe
+tests/test_config
 
 # Demo
 demo.cast

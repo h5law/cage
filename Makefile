@@ -7,12 +7,14 @@ TARGET := cage
 
 SOURCES := \
 	src/cage.c \
-	src/container.c
+	src/container.c \
+	src/config.c
 
 OBJECTS := $(SOURCES:.c=.o)
 
 TEST_RUNNER := tests/test_runner
 TEST_PROBE := tests/container_probe
+TEST_CONFIG := tests/test_config
 
 $(TARGET): $(OBJECTS)
 	$(CC) $(CFLAGS) $(OBJECTS) -o $@
@@ -24,12 +26,19 @@ $(TEST_PROBE): tests/container_probe.c
 	$(CC) $(CFLAGS) $< -static -o $@
 
 $(TEST_RUNNER): tests/test_runner.c
-	$(CC) $(CFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
-test: $(TARGET) $(TEST_RUNNER) $(TEST_PROBE)
-	$(TEST_RUNNER) ./$(TARGET) ./$(TEST_PROBE)
+$(TEST_CONFIG): tests/test_config.c src/config.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_config.c src/config.c -o $@
+
+test-config: $(TEST_CONFIG)
+	./$(TEST_CONFIG)
+
+test: $(TARGET) $(TEST_RUNNER) $(TEST_PROBE) $(TEST_CONFIG)
+	./$(TEST_CONFIG)
+	./$(TEST_RUNNER) ./$(TARGET) ./$(TEST_PROBE)
 
 clean:
-	rm -f $(OBJECTS) $(TARGET) $(TEST_RUNNER) $(TEST_PROBE)
+	rm -f $(OBJECTS) $(TARGET) $(TEST_RUNNER) $(TEST_PROBE) $(TEST_CONFIG)
 
-.PHONY: clean test
+.PHONY: clean test test-config
