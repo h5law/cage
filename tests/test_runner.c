@@ -1,5 +1,6 @@
 #include "utils.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
@@ -7,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -1078,6 +1080,89 @@ static int test_configured_mount_survives_teardown(void)
     return 0;
 }
 
+static int test_mount_propagation(void)
+{
+    test_begin("mounts do not propagate to host");
+
+    char config[PATH_MAX];
+    char rootfs[PATH_MAX];
+    char mount_dir[PATH_MAX];
+
+    if (make_config(config, sizeof(config)) < 0) {
+        test_fail("failed to create configuration");
+        return -1;
+    }
+
+    if (create_rootfs(probe_path, TEST_ROOTFS, rootfs, sizeof(rootfs)) < 0) {
+        unlink(config);
+        test_fail("failed to create rootfs");
+        return -1;
+    }
+
+    if (make_temp_dir(TEST_MOUNT, mount_dir, sizeof(mount_dir)) < 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        test_fail("failed to create mount source");
+        return -1;
+    }
+
+    if (create_config(config, rootfs, NULL) < 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to create configuration");
+        return -1;
+    }
+
+    FILE *fp = fopen(config, "a");
+
+    if (fp == NULL) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to open configuration");
+        return -1;
+    }
+
+    if (fprintf(fp,
+                "\n"
+                "[[mounts]]\n"
+                "source = \"%s\"\n"
+                "target = \"/data\"\n",
+                mount_dir) < 0 ||
+        fclose(fp) != 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to append mount configuration");
+        return -1;
+    }
+
+    char *argv[] = {
+            ( char * )cage_path,
+            ( char * )"--config",
+            config,
+            ( char * )"/bin/probe",
+            ( char * )"mount-private",
+            ( char * )"/data",
+            NULL,
+    };
+
+    int status = run_process(argv);
+
+    unlink(config);
+    remove_tree(rootfs);
+    remove_tree(mount_dir);
+
+    if (status != 0) {
+        test_fail("configured mount was shared");
+        return -1;
+    }
+
+    test_pass();
+    return 0;
+}
+
 static int test_configured_mount_failure_cleanup(void)
 {
     test_begin("configured mount failure cleans up");
@@ -1355,6 +1440,7 @@ int main(int argc, char **argv)
     test_configured_writable_mount();
     test_configured_readonly_mount();
     test_configured_mount_survives_teardown();
+    test_mount_propagation();
     test_configured_mount_failure_cleanup();
     test_tmpfs_setup_failure_cleanup();
     test_repeated_container_lifecycle();

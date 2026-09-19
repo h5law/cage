@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
@@ -283,12 +284,79 @@ static int probe_dev(const char *path)
     return S_ISCHR(st.st_mode) ? 0 : 1;
 }
 
+static int probe_mount_private(const char *target)
+{
+    FILE *fp;
+    char  line[8192];
+
+    fp = fopen("/proc/self/mountinfo", "r");
+
+    if (fp == NULL)
+        return 1;
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *separator;
+        char *mount_point;
+        char *optional;
+
+        separator = strstr(line, " - ");
+
+        if (separator == NULL)
+            continue;
+
+        *separator = '\0';
+
+        /*
+         * mountinfo fields:
+         *
+         * mount ID
+         * parent ID
+         * major:minor
+         * root
+         * mount point
+         *
+         * The mount point is the fifth whitespace-separated field.
+         */
+        char *saveptr;
+        char *field = strtok_r(line, " ", &saveptr);
+
+        for (int i = 0; field != NULL && i < 4; ++i)
+            field = strtok_r(NULL, " ", &saveptr);
+
+        if (field == NULL)
+            continue;
+
+        mount_point = field;
+
+        if (strcmp(mount_point, target) != 0)
+            continue;
+
+        optional = strtok_r(NULL, " ", &saveptr);
+
+        while (optional != NULL) {
+            if (strncmp(optional, "shared:", 7) == 0) {
+                fclose(fp);
+                return 1;
+            }
+
+            optional = strtok_r(NULL, " ", &saveptr);
+        }
+
+        fclose(fp);
+        return 0;
+    }
+
+    fclose(fp);
+    return 1;
+}
+
 static int probe_capabilities(void)
 {
     FILE *fp;
     char  buf[4096];
 
     fp = fopen("/proc/self/status", "r");
+
     if (fp == NULL)
         return 1;
 
@@ -348,6 +416,7 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "exit") == 0) {
         if (argc != 3)
             return 1;
+
         return probe_exit(argv[2]);
     }
 
@@ -367,6 +436,7 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "signal") == 0) {
         if (argc != 3)
             return 1;
+
         return probe_signal(argv[2]);
     }
 
@@ -386,6 +456,7 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "check-lock") == 0) {
         if (argc != 3)
             return 1;
+
         return probe_check_lock(argv[2]);
     }
 
@@ -406,19 +477,29 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "tmpfs") == 0) {
         if (argc != 3)
             return 1;
+
         return probe_tmpfs(argv[2]);
     }
 
     if (strcmp(argv[1], "proc") == 0) {
         if (argc != 3)
             return 1;
+
         return probe_proc(argv[2]);
     }
 
     if (strcmp(argv[1], "dev") == 0) {
         if (argc != 3)
             return 1;
+
         return probe_dev(argv[2]);
+    }
+
+    if (strcmp(argv[1], "mount-private") == 0) {
+        if (argc != 3)
+            return 1;
+
+        return probe_mount_private(argv[2]);
     }
 
     if (strcmp(argv[1], "capabilities") == 0)
@@ -433,12 +514,14 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "write-file") == 0) {
         if (argc != 4)
             return 1;
+
         return probe_write_file(argv[2], argv[3]);
     }
 
     if (strcmp(argv[1], "read-file") == 0) {
         if (argc != 4)
             return 1;
+
         return probe_read_file(argv[2], argv[3]);
     }
 
