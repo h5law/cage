@@ -1,0 +1,10 @@
+# cage escape/security test configuration
+#
+rootfs = "/tmp/cage-escape-rootfs-UNIQUE"
+
+# Example of the bind configuration exercised by the suite:
+#
+# [[mounts]]
+# source = "/tmp/cage-escape-host-UNIQUE/allowed"
+# target = "/mnt/allowed"
+# readonly = true

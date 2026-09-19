@@ -1,5 +1,6 @@
 #include "escape_utils.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -25,7 +26,6 @@ void escape_test_begin(const char *name)
 void escape_test_pass(void)
 {
     puts("[PASS]");
-
     ++tests_passed;
 }
 
@@ -55,6 +55,7 @@ int escape_run_process(char *const argv[])
 
     if (pid == 0) {
         execv(argv[0], argv);
+        perror("exec test runner");
         _exit(127);
     }
 
@@ -72,6 +73,7 @@ pid_t escape_start_process(const char *path, char *const argv[])
 
     if (pid == 0) {
         execv(path, argv);
+        perror("exec test process");
         _exit(127);
     }
 
@@ -147,7 +149,11 @@ int escape_write_file(const char *path, const char *contents)
     written = 0;
 
     while (written < length) {
-        ssize_t n = write(fd, contents + written, length - written);
+        ssize_t n;
+
+        do {
+            n = write(fd, contents + written, length - written);
+        } while (n == -1 && errno == EINTR);
 
         if (n == -1) {
             int saved_errno = errno;
@@ -213,53 +219,82 @@ int escape_file_exists(const char *path)
     return stat(path, &st) == 0;
 }
 
-int escape_remove_tree(const char *path)
+static int remove_tree_internal(const char *path)
 {
-    char command[PATH_MAX + 32];
+    DIR           *dir;
+    struct dirent *entry;
+    struct stat    st;
+    char           child[PATH_MAX];
 
-    if (snprintf(command, sizeof(command), "rm -rf -- '%s'", path) >=
-        ( int )sizeof(command)) {
-        errno = ENAMETOOLONG;
+    dir = opendir(path);
+
+    if (dir == NULL) {
+        if (errno == ENOENT)
+            return 0;
+
         return -1;
     }
 
-    return system(command);
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        if (snprintf(child, sizeof(child), "%s/%s", path, entry->d_name) >=
+            ( int )sizeof(child)) {
+            errno = ENAMETOOLONG;
+            closedir(dir);
+            return -1;
+        }
+
+        if (lstat(child, &st) == -1) {
+            if (errno == ENOENT)
+                continue;
+
+            closedir(dir);
+            return -1;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            if (remove_tree_internal(child) == -1) {
+                closedir(dir);
+                return -1;
+            }
+        } else {
+            if (unlink(child) == -1) {
+                closedir(dir);
+                return -1;
+            }
+        }
+    }
+
+    if (closedir(dir) == -1)
+        return -1;
+
+    return rmdir(path);
 }
 
-int escape_create_rootfs(const char *probe_path, const char *template,
-                         char *rootfs, size_t size)
+int escape_remove_tree(const char *path) { return remove_tree_internal(path); }
+
+static int copy_file(const char *source, const char *destination)
 {
-    char bin[PATH_MAX];
-    char probe[PATH_MAX];
     int  in;
     int  out;
     char buffer[8192];
 
-    if (escape_make_temp_dir(template, rootfs, size) == -1)
-        return -1;
-
-    if (snprintf(bin, sizeof(bin), "%s/bin", rootfs) >= ( int )sizeof(bin)) {
-        goto error;
-    }
-
-    if (mkdir(bin, 0755) == -1)
-        goto error;
-
-    if (snprintf(probe, sizeof(probe), "%s/bin/escape-probe", rootfs) >=
-        ( int )sizeof(probe)) {
-        goto error;
-    }
-
-    in = open(probe_path, O_RDONLY | O_CLOEXEC);
+    in = open(source, O_RDONLY | O_CLOEXEC);
 
     if (in == -1)
-        goto error;
+        return -1;
 
-    out = open(probe, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
+    out = open(destination, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
 
     if (out == -1) {
+        int saved_errno = errno;
+
         close(in);
-        goto error;
+        errno = saved_errno;
+
+        return -1;
     }
 
     for (;;) {
@@ -279,14 +314,18 @@ int escape_create_rootfs(const char *probe_path, const char *template,
             close(out);
             errno = saved_errno;
 
-            goto error;
+            return -1;
         }
 
         {
             size_t written = 0;
 
             while (written < ( size_t )n) {
-                ssize_t w = write(out, buffer + written, ( size_t )n - written);
+                ssize_t w;
+
+                do {
+                    w = write(out, buffer + written, ( size_t )n - written);
+                } while (w == -1 && errno == EINTR);
 
                 if (w == -1) {
                     int saved_errno = errno;
@@ -295,7 +334,7 @@ int escape_create_rootfs(const char *probe_path, const char *template,
                     close(out);
                     errno = saved_errno;
 
-                    goto error;
+                    return -1;
                 }
 
                 if (w == 0) {
@@ -303,7 +342,7 @@ int escape_create_rootfs(const char *probe_path, const char *template,
                     close(out);
                     errno = EIO;
 
-                    goto error;
+                    return -1;
                 }
 
                 written += ( size_t )w;
@@ -311,13 +350,59 @@ int escape_create_rootfs(const char *probe_path, const char *template,
         }
     }
 
-    close(in);
-    close(out);
+    if (fchmod(out, 0755) == -1) {
+        int saved_errno = errno;
+
+        close(in);
+        close(out);
+        errno = saved_errno;
+
+        return -1;
+    }
+
+    if (close(in) == -1) {
+        int saved_errno = errno;
+
+        close(out);
+        errno = saved_errno;
+
+        return -1;
+    }
+
+    return close(out);
+}
+
+int escape_create_rootfs(const char *probe_path, const char *template,
+                         char *rootfs, size_t size)
+{
+    char bin[PATH_MAX];
+    char probe[PATH_MAX];
+
+    if (escape_make_temp_dir(template, rootfs, size) == -1)
+        return -1;
+
+    if (snprintf(bin, sizeof(bin), "%s/bin", rootfs) >= ( int )sizeof(bin))
+        goto error;
+
+    if (mkdir(bin, 0755) == -1)
+        goto error;
+
+    if (snprintf(probe, sizeof(probe), "%s/bin/escape-probe", rootfs) >=
+        ( int )sizeof(probe))
+        goto error;
+
+    if (copy_file(probe_path, probe) == -1)
+        goto error;
 
     return 0;
 
-error:
+error: {
+    int saved_errno = errno;
+
     escape_remove_tree(rootfs);
+    errno = saved_errno;
+}
+
     return -1;
 }
 
@@ -331,7 +416,15 @@ int escape_create_config(const char *path, const char *rootfs,
     if (file == NULL)
         return -1;
 
-    if (fprintf(file, "rootfs = \"%s\"\n", rootfs) < 0) {
+    if (fprintf(file,
+                "# cage escape-suite configuration\n"
+                "#\n"
+                "# The rootfs path is generated uniquely for each test.\n"
+                "# Additional mount entries are supplied by the individual\n"
+                "# test case.\n"
+                "\n"
+                "rootfs = \"%s\"\n",
+                rootfs) < 0) {
         fclose(file);
         return -1;
     }

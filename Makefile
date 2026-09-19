@@ -63,4 +63,4 @@ clean:
 		$(TEST_ESCAPE_RUNNER) \
 		$(TEST_ESCAPE_PROBE)
 
-.PHONY: clean test test-config
+.PHONY: clean test test-config test-escape

@@ -15,7 +15,6 @@ pid_t escape_start_process(const char *path, char *const argv[]);
 int   escape_wait_process(pid_t pid);
 
 int escape_make_temp_dir(const char *template, char *out, size_t size);
-
 int escape_make_temp_file(const char *template, char *out, size_t size);
 
 int escape_write_file(const char *path, const char *contents);
