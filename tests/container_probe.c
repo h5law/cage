@@ -360,17 +360,6 @@ static int probe_mount_private(const char *target)
 
         *separator = '\0';
 
-        /*
-         * mountinfo fields:
-         *
-         * mount ID
-         * parent ID
-         * major:minor
-         * root
-         * mount point
-         *
-         * The mount point is the fifth whitespace-separated field.
-         */
         char *saveptr;
         char *field = strtok_r(line, " ", &saveptr);
 

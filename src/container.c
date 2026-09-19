@@ -447,11 +447,34 @@ static void cleanup_setup_mounts(struct container *container)
         perror("cleanup overlay root");
 }
 
-static int cleanup_mounts(void)
+static int
+cleanup_configured_mounts_after_pivot(const struct container *container)
+{
+    const struct cage_config *config = container->config;
+
+    for (size_t i = config->mount_count; i > 0; --i) {
+        const struct mount_config *mount_config = &config->mounts[i - 1];
+
+        if (umount2(mount_config->target, MNT_DETACH) == -1 &&
+            errno != EINVAL && errno != ENOENT) {
+            fprintf(stderr,
+                    "cage: failed to unmount configured mount '%s': %s\n",
+                    mount_config->target, strerror(errno));
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int cleanup_mounts(const struct container *container)
 {
     static const char *const devices[] = {
             "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty",
     };
+
+    if (cleanup_configured_mounts_after_pivot(container) == -1)
+        return -1;
 
     for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
         if (umount2(devices[i], MNT_DETACH) == -1 && errno != EINVAL &&
@@ -469,10 +492,6 @@ static int cleanup_mounts(void)
         errno != ENOENT)
         return -1;
 
-    /*
-     * After pivot_root(), the OverlayFS mount is the container's
-     * root filesystem.
-     */
     if (umount2("/", MNT_DETACH) == -1 && errno != EINVAL && errno != ENOENT)
         return -1;
 
@@ -1263,7 +1282,7 @@ static int child_main(void *arg)
         close_overlay_work(ctx);
 
         if (pivoted)
-            cleanup_mounts();
+            cleanup_mounts(ctx->container);
         else
             cleanup_setup_mounts(ctx->container);
 
@@ -1275,7 +1294,7 @@ static int child_main(void *arg)
 
         close_overlay_work(ctx);
 
-        if (cleanup_mounts() == -1)
+        if (cleanup_mounts(ctx->container) == -1)
             perror("cleanup mounts");
 
         return 1;
@@ -1287,13 +1306,14 @@ static int child_main(void *arg)
         close(ctx->work_fd);
         ctx->work_fd = -1;
 
-        cleanup_mounts();
+        if (cleanup_mounts(ctx->container) == -1)
+            perror("cleanup mounts");
         return 1;
     }
 
     status = run_command(ctx);
 
-    if (cleanup_mounts() == -1)
+    if (cleanup_mounts(ctx->container) == -1)
         perror("cleanup mounts");
 
     close_overlay_work(ctx);

@@ -43,6 +43,26 @@ static int runtime_dirs_unchanged(int before)
     return after == before ? 0 : 1;
 }
 
+static bool mountinfo_contains(const char *needle)
+{
+    FILE *fp = fopen("/proc/self/mountinfo", "r");
+
+    if (fp == NULL)
+        return false;
+
+    char line[8192];
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        if (strstr(line, needle) != NULL) {
+            fclose(fp);
+            return true;
+        }
+    }
+
+    fclose(fp);
+    return false;
+}
+
 static int prepare_rootfs_and_config(char *rootfs, size_t rootfs_size,
                                      char *config, size_t config_size)
 {
@@ -1103,9 +1123,7 @@ static int test_mount_cleanup_after_normal_exit(void)
         return -1;
     }
 
-    FILE *mount_fp = fopen(mount_file, "w");
-
-    if (mount_fp == NULL) {
+    if (write_file(mount_file, "persistent\n") < 0) {
         unlink(config);
         remove_tree(rootfs);
         remove_tree(mount_dir);
@@ -1113,11 +1131,118 @@ static int test_mount_cleanup_after_normal_exit(void)
         return -1;
     }
 
-    if (fputs("persistent\n", mount_fp) < 0 || fclose(mount_fp) != 0) {
+    FILE *fp = fopen(config, "w");
+
+    if (fp == NULL) {
         unlink(config);
         remove_tree(rootfs);
         remove_tree(mount_dir);
-        test_fail("failed to write mount source file");
+        test_fail("failed to create configuration");
+        return -1;
+    }
+
+    if (fprintf(fp,
+                "rootfs = \"%s\"\n\n"
+                "[[mounts]]\n"
+                "source = \"%s\"\n"
+                "target = \"/state\"\n",
+                rootfs, mount_dir) < 0 ||
+        fclose(fp) != 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to write configuration");
+        return -1;
+    }
+
+    if (mountinfo_contains(mount_dir)) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("mount source was already present in host mountinfo");
+        return -1;
+    }
+
+    char *argv[] = {
+            ( char * )cage_path,    ( char * )"--config", config,
+            ( char * )"/bin/probe", ( char * )"success",  NULL,
+    };
+
+    int status = run_process(argv);
+
+    if (status != 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("container did not exit normally");
+        return -1;
+    }
+
+    if (mountinfo_contains(mount_dir)) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("configured mount leaked into host mountinfo");
+        return -1;
+    }
+
+    char contents[128];
+
+    if (read_file(mount_file, contents, sizeof(contents)) < 0 ||
+        strcmp(contents, "persistent\n") != 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("host-backed mount data was modified");
+        return -1;
+    }
+
+    unlink(config);
+    remove_tree(rootfs);
+
+    if (remove_tree(mount_dir) != 0) {
+        test_fail(
+                "configured mount source could not be removed after teardown");
+        return -1;
+    }
+
+    test_pass();
+    return 0;
+}
+
+static int test_mount_cleanup_after_abnormal_exit(void)
+{
+    test_begin("mounts are cleaned up after abnormal container exit");
+
+    char config[PATH_MAX];
+    char rootfs[PATH_MAX];
+    char mount_dir[PATH_MAX];
+    char lock_path[PATH_MAX];
+
+    if (make_config(config, sizeof(config)) < 0) {
+        test_fail("failed to create configuration");
+        return -1;
+    }
+
+    if (create_rootfs(probe_path, TEST_ROOTFS, rootfs, sizeof(rootfs)) < 0) {
+        unlink(config);
+        test_fail("failed to create rootfs");
+        return -1;
+    }
+
+    if (make_temp_dir(TEST_MOUNT, mount_dir, sizeof(mount_dir)) < 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        test_fail("failed to create mount source");
+        return -1;
+    }
+
+    if (snprintf(lock_path, sizeof(lock_path), "%s/lock", mount_dir) >=
+        ( int )sizeof(lock_path)) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("lock path is too long");
         return -1;
     }
 
@@ -1146,8 +1271,13 @@ static int test_mount_cleanup_after_normal_exit(void)
     }
 
     char *argv[] = {
-            ( char * )cage_path,    ( char * )"--config", config,
-            ( char * )"/bin/probe", ( char * )"success",  NULL,
+            ( char * )cage_path,
+            ( char * )"--config",
+            config,
+            ( char * )"/bin/probe",
+            ( char * )"hold-kill",
+            ( char * )"/state/lock",
+            NULL,
     };
 
     pid_t pid = start_process(cage_path, argv);
@@ -1160,59 +1290,66 @@ static int test_mount_cleanup_after_normal_exit(void)
         return -1;
     }
 
-    int status;
+    char marker[PATH_MAX];
 
-    if (waitpid(pid, &status, 0) < 0) {
+    if (snprintf(marker, sizeof(marker), "%s.started", lock_path) >=
+        ( int )sizeof(marker)) {
+        kill(pid, SIGKILL);
+        wait_process(pid);
         unlink(config);
         remove_tree(rootfs);
         remove_tree(mount_dir);
-        test_fail("failed waiting for cage");
+        test_fail("marker path is too long");
         return -1;
     }
 
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    bool workload_started = false;
+
+    for (int i = 0; i < 30; ++i) {
+        if (access(marker, F_OK) == 0) {
+            workload_started = true;
+            break;
+        }
+
+        usleep(100000);
+    }
+
+    if (!workload_started) {
+        kill(pid, SIGKILL);
+        wait_process(pid);
         unlink(config);
         remove_tree(rootfs);
         remove_tree(mount_dir);
-        test_fail("container did not exit normally");
+        test_fail("abnormal workload did not start");
         return -1;
     }
 
-    if (access(mount_file, F_OK) != 0) {
+    int status = wait_process(pid);
+
+    if (status != 128 + SIGKILL) {
         unlink(config);
         remove_tree(rootfs);
         remove_tree(mount_dir);
-        test_fail("host-backed mount data disappeared");
+        test_fail("cage did not propagate SIGKILL termination");
         return -1;
     }
 
-    char  contents[32];
-    FILE *check_fp = fopen(mount_file, "r");
-
-    if (check_fp == NULL) {
+    if (mountinfo_contains(mount_dir)) {
         unlink(config);
         remove_tree(rootfs);
         remove_tree(mount_dir);
-        test_fail("failed to reopen host-backed file");
-        return -1;
-    }
-
-    bool valid = fgets(contents, sizeof(contents), check_fp) != NULL &&
-                 strcmp(contents, "persistent\n") == 0;
-
-    fclose(check_fp);
-
-    if (!valid) {
-        unlink(config);
-        remove_tree(rootfs);
-        remove_tree(mount_dir);
-        test_fail("host-backed mount data was modified");
+        test_fail("configured mount leaked into host mountinfo");
         return -1;
     }
 
     unlink(config);
     remove_tree(rootfs);
-    remove_tree(mount_dir);
+
+    if (remove_tree(mount_dir) != 0) {
+        test_fail("configured mount source could not be removed after abnormal "
+                  "teardown");
+        return -1;
+    }
 
     test_pass();
     return 0;
@@ -1900,6 +2037,7 @@ int main(int argc, char **argv)
     test_parent_death();
     test_abnormal_child_termination();
     test_mount_cleanup_after_normal_exit();
+    test_mount_cleanup_after_abnormal_exit();
 
     test_configured_writable_mount();
     test_configured_readonly_mount();
