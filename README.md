@@ -1,33 +1,27 @@
 # cage
 
-A small, Linux-native container runtime written in C.
+A small Linux container runtime written in C.
 
-`cage` is a deliberately minimal container runtime built around Linux namespaces, `pivot_root`, OverlayFS, capability dropping, and a small configuration file.
+`cage` uses Linux namespaces, OverlayFS, `pivot_root`, mounts, and Linux security primitives to provide a simple isolated environment for running a process.
 
-It is designed to make the mechanics of Linux containers explicit rather than hide them behind a large abstraction layer.
+It intentionally avoids images, registries, daemons, and orchestration.
 
-> **Status:** early development — not production hardened.
+> **Status:** early development. Not production hardened.
 
-## What cage does
+## Features
 
-`cage` creates an isolated Linux process environment with:
-
-* PID namespace isolation
-* mount namespace isolation
-* UTS namespace isolation
-* IPC namespace isolation
-* network namespace isolation
-* a private `/dev`
-* a private `/proc`
-* an OverlayFS-backed writable root
-* configurable bind mounts
-* dropped Linux capabilities
-* a restricted capability bounding set
+* PID, mount, UTS, IPC, and network namespaces
+* Isolated `/proc` and `/dev`
+* OverlayFS-backed writable root filesystem
+* Configurable bind mounts
+* Dropped Linux capabilities
+* Restricted capability bounding set
 * `no_new_privs`
-* parent-death handling
-* inherited file descriptor cleanup
-
-The container runs a normal Linux executable. There is no daemon, image format, registry, or container service involved.
+* Parent-death handling
+* Inherited file-descriptor cleanup
+* Process-state sanitisation
+* Container-wide descendant cleanup
+* Configuration-driven runtime
 
 ## Usage
 
@@ -38,104 +32,42 @@ cage [options] <executable> [arguments...]
 Options:
 
 ```text
---config <path>  use the specified configuration file
--h, --help       show this help message
+--config <path>  use a configuration file
+-h, --help       show help
 ```
 
-For example:
+Example:
 
 ```sh
 cage --config cage.toml /bin/sh
 ```
 
-If `--config` is omitted, `cage` looks for:
-
-```text
-cage.toml
-```
-
-in the current working directory.
-
-The configuration file defines the root filesystem and any additional mounts.
+When `--config` is omitted, `cage` looks for `cage.toml` in the current directory.
 
 ## Configuration
 
-A minimal configuration is:
+A minimal configuration:
 
 ```toml
 rootfs = "./rootfs"
 ```
 
-A configuration with additional mounts:
+Additional host paths can be exposed with bind mounts:
 
 ```toml
 rootfs = "./rootfs"
 
-[[mounts]]
-source = "/tmp/cage-mount"
-target = "/data"
-
-[[mounts]]
-source = "/home/user/project"
-target = "/workspace"
-readonly = true
-```
-
-### Root filesystem
-
-`rootfs` specifies the directory used as the container's supplied root filesystem.
-
-The path must refer to an existing directory.
-
-The supplied root filesystem is used as the **lower layer** of an OverlayFS mount. `cage` does not modify this directory during normal container execution.
-
-### Mounts
-
-Additional host paths can be exposed inside the container with `[[mounts]]`.
-
-Each mount has:
-
-```toml
-[[mounts]]
-source = "/host/path"
-target = "/container/path"
-readonly = false
-```
-
-`source` is a path on the host.
-
-`target` is an absolute path inside the container.
-
-`readonly` controls whether the configured bind mount is writable from inside the container. It defaults to `false`.
-
-For example:
-
-```toml
 [[mounts]]
 source = "/tmp/cage-data"
 target = "/data"
-```
 
-makes the host directory available as:
-
-```text
-/data
-```
-
-inside the container.
-
-A read-only mount can be configured with:
-
-```toml
 [[mounts]]
 source = "/home/user/project"
 target = "/workspace"
 readonly = true
 ```
 
-The configuration parser deliberately implements only the subset of TOML required by `cage`. It is not intended to be a general-purpose TOML implementation.
-
-Currently supported configuration values are:
+Supported settings are:
 
 * `rootfs`
 * `[[mounts]]`
@@ -145,9 +77,11 @@ Currently supported configuration values are:
 
 Unknown settings and duplicate fields are rejected.
 
+The configuration parser implements only the TOML features required by `cage`; it is not a general-purpose TOML parser.
+
 ## Root filesystem
 
-`cage` requires a supplied root filesystem.
+`cage` requires an existing directory as its root filesystem.
 
 For example:
 
@@ -157,58 +91,18 @@ rootfs/
 ├── etc/
 ├── lib/
 ├── lib64/
-├── proc/
 ├── sbin/
-├── tmp/
 ├── usr/
 └── var/
 ```
 
-The root filesystem can be produced by any mechanism capable of providing a usable Linux filesystem tree.
+The root filesystem is used as the **lower layer** of an OverlayFS mount.
 
-`cage` does not manage images or distributions.
+The writable upper and work directories are created in a temporary runtime directory.
 
-A root filesystem is simply a directory supplied to the runtime.
+Therefore, normal changes made inside the container do not modify the supplied rootfs.
 
-## Rootfs and OverlayFS
-
-The supplied root filesystem acts as the immutable lower layer of an OverlayFS filesystem.
-
-Conceptually:
-
-```text
-             supplied rootfs
-              lower layer
-                   │
-                   ▼
-             ┌───────────┐
-             │ OverlayFS │
-             └─────┬─────┘
-                   │
-                   ▼
-             container root
-```
-
-The writable OverlayFS upper and work directories are created in a temporary runtime directory.
-
-They exist only for the lifetime of the container.
-
-This provides two important properties:
-
-1. The supplied root filesystem remains unchanged.
-2. Normal filesystem changes made by the container disappear when the container is destroyed.
-
-## Filesystem changes
-
-Suppose the container starts with:
-
-```text
-rootfs/
-└── etc/
-    └── config
-```
-
-Inside the container:
+For example:
 
 ```sh
 echo changed > /etc/config
@@ -216,43 +110,11 @@ touch /tmp/example
 rm /etc/config
 ```
 
-These operations affect the OverlayFS upper layer rather than the supplied root filesystem.
+These changes exist only in the temporary OverlayFS layer and disappear when the container is destroyed.
 
-When the container exits, the temporary upper layer is removed.
+### Bind mounts
 
-The original rootfs therefore remains:
-
-```text
-rootfs/
-└── etc/
-    └── config
-```
-
-with its original contents.
-
-### New files
-
-Files created inside the normal container filesystem are stored in the temporary OverlayFS upper layer.
-
-They disappear when the container is torn down.
-
-### Modifications
-
-Changes to files originating from the supplied rootfs are represented in the OverlayFS upper layer.
-
-They do not modify the supplied rootfs.
-
-### Deletions
-
-Deleting a file from the container creates the appropriate OverlayFS whiteout state in the upper layer.
-
-The lower-layer file therefore appears deleted from inside the container without being removed from the supplied rootfs.
-
-## Configured mounts are different
-
-Configured bind mounts intentionally bypass the disposable OverlayFS layer.
-
-For example:
+Configured bind mounts are different.
 
 ```toml
 [[mounts]]
@@ -260,115 +122,163 @@ source = "/tmp/cage-data"
 target = "/data"
 ```
 
-means that `/data` is backed directly by:
+`/data` is backed directly by `/tmp/cage-data` on the host.
 
-```text
-/tmp/cage-data
+Changes made through the mount therefore persist after the container exits.
+
+Use:
+
+```toml
+readonly = true
 ```
 
-on the host.
+when the container should be able to access a host path without modifying it.
 
-Therefore:
+| Location                    | Storage             | Persists          |
+| --------------------------- | ------------------- | ----------------- |
+| Normal container filesystem | Temporary OverlayFS | No                |
+| Configured writable mount   | Host filesystem     | Yes               |
+| Configured read-only mount  | Host filesystem     | Host changes only |
 
-```sh
-echo hello > /data/file
-```
+## Container lifecycle
 
-can modify the host filesystem.
-
-This is intentional.
-
-### Persistence model
-
-| Filesystem location                   | Backing storage | Persists after exit |
-| ------------------------------------- | --------------- | ------------------- |
-| `/etc`                                | OverlayFS       | No                  |
-| `/tmp`                                | OverlayFS       | No                  |
-| `/usr`                                | OverlayFS       | No                  |
-| `/data` configured as bind mount      | Host path       | Yes                 |
-| `/workspace` configured as bind mount | Host path       | Yes                 |
-
-Configured mounts should therefore be treated as explicit persistence or host-integration points.
-
-Use `readonly = true` when the container should be able to access a host path without modifying it.
-
-## Filesystem lifecycle
-
-The filesystem setup broadly follows:
+The runtime follows this general sequence:
 
 ```text
-supplied rootfs
-      │
-      ▼
-create temporary runtime directory
-      │
-      ├── upper/
-      └── work/
-      │
-      ▼
-mount OverlayFS
-      │
-      ▼
-private container root
-      │
-      ├── /proc
-      ├── /dev
-      └── configured bind mounts
-      │
-      ▼
+load configuration
+        │
+        ▼
+validate rootfs
+        │
+        ▼
+create container
+        │
+        ▼
+create namespaces
+        │
+        ▼
+prepare OverlayFS
+        │
+        ▼
+prepare /proc and /dev
+        │
+        ▼
 pivot_root
-      │
-      ▼
-execute process
-      │
-      ▼
-container exits
-      │
-      ▼
-unmount / cleanup
-      │
-      ▼
-remove temporary OverlayFS state
+        │
+        ▼
+configure bind mounts
+        │
+        ▼
+drop privileges
+        │
+        ▼
+sanitise process state
+        │
+        ▼
+exec requested process
+        │
+        ▼
+wait and reap descendants
+        │
+        ▼
+cleanup mounts and runtime state
 ```
 
-The supplied root filesystem is never used as the writable container layer.
+The host process supervises the container lifecycle.
 
-## Architecture
+The container's init process is PID 1 inside its PID namespace and is responsible for reaping descendants.
 
-The runtime is intentionally small.
+During teardown, remaining descendants are terminated and forcibly killed if they do not exit within the grace period.
 
-```text
-                  cage
-                   │
-                   ▼
-            parse configuration
-                   │
-                   ▼
-             create container
-                   │
-        ┌──────────┴──────────┐
-        │                     │
-        ▼                     ▼
-    namespaces            filesystem
-        │                     │
-        │              ┌──────┴──────┐
-        │              │             │
-        │           OverlayFS    bind mounts
-        │              │             │
-        │              └──────┬──────┘
-        │                     │
-        └──────────┬──────────┘
-                   ▼
-               pivot_root
-                   │
-                   ▼
-             security setup
-                   │
-                   ▼
-                execve
-```
+## Isolation
 
-The implementation is divided into a small number of components:
+### PID namespace
+
+The container has its own PID namespace.
+
+Its init process is PID 1 and processes inside the container have a separate PID view from the host.
+
+### Mount namespace
+
+The container has a private mount namespace.
+
+Mount operations performed inside the container do not directly modify the host mount namespace.
+
+### UTS namespace
+
+The container has an independent hostname and domain-name namespace.
+
+### IPC namespace
+
+System V IPC and POSIX message queues are isolated from the host.
+
+### Network namespace
+
+The container has its own network namespace.
+
+`cage` does not configure networking itself.
+
+### `/proc`
+
+A private proc filesystem is mounted inside the container and reflects the container's PID namespace.
+
+### `/dev`
+
+A private `/dev` is provided with the basic devices required by the container.
+
+## Security
+
+`cage` applies several privilege and state restrictions before executing the workload.
+
+### Capabilities
+
+Linux capabilities are dropped and the capability bounding set is restricted.
+
+### `no_new_privs`
+
+`PR_SET_NO_NEW_PRIVS` is enabled before execution, preventing the workload and its descendants from gaining additional privileges through mechanisms such as set-user-ID executables and file capabilities.
+
+### Parent death
+
+The container establishes parent-death handling so it cannot continue independently after its supervisor disappears.
+
+The implementation also checks parent liveness to handle the race between child creation and parent-death configuration.
+
+### File descriptors
+
+Inherited file descriptors from the launching process are closed before execution.
+
+Standard input, output, and error remain available.
+
+### Process state
+
+The workload does not inherit cage's supervisor state.
+
+Before execution, `cage`:
+
+* resets the inherited signal mask
+* resets cage-installed signal handlers
+* establishes a `022` umask
+* changes the working directory to `/`
+* clears the inherited environment
+* establishes a minimal container environment
+
+## Failure handling
+
+Container creation consists of several operations that can fail.
+
+If setup fails, `cage` cleans up the resources created for that container rather than leaving a partially configured environment running.
+
+This includes:
+
+* mounts
+* OverlayFS state
+* temporary runtime directories
+* child processes
+
+The test suite includes failure-path and teardown regression tests for these cases.
+
+## Project structure
 
 ```text
 include/
@@ -382,343 +292,27 @@ src/
 └── container.c
 
 tests/
+├── container_probe.c
 └── test_runner.c
 ```
 
-## Container lifecycle
-
-A container follows this general lifecycle:
-
-```text
-CLI
- │
- ▼
-load configuration
- │
- ▼
-validate rootfs
- │
- ▼
-clone child
- │
- ▼
-create namespaces
- │
- ▼
-configure hostname
- │
- ▼
-mount OverlayFS
- │
- ▼
-prepare /dev and /proc
- │
- ▼
-pivot_root
- │
- ▼
-mount configured bind mounts
- │
- ▼
-drop privileges
- │
- ▼
-close inherited file descriptors
- │
- ▼
-execve
- │
- ▼
-process exits
- │
- ▼
-parent cleans up
-```
-
-The parent process owns the lifecycle of the container and performs cleanup after the child exits.
-
-## Isolation
-
-### PID namespace
-
-The container receives its own PID namespace.
-
-The container's init process becomes PID 1 inside that namespace.
-
-Processes created inside the container therefore have a separate PID view from the host.
-
-### Mount namespace
-
-The container receives a private mount namespace.
-
-Mount operations performed inside the container do not directly alter the host mount namespace.
-
-### UTS namespace
-
-The container receives an independent hostname and domain-name namespace.
-
-### IPC namespace
-
-System V IPC and POSIX message queue state is isolated from the host.
-
-### Network namespace
-
-The container receives its own network namespace.
-
-No network interfaces are configured by `cage` itself.
-
-### `/dev`
-
-A private `/dev` is created for the container.
-
-Only the devices explicitly provided by the runtime are made available.
-
-### `/proc`
-
-A private proc filesystem is mounted inside the container.
-
-It reflects the container's PID namespace rather than exposing the host's process tree directly.
-
-## Security model
-
-`cage` applies several basic privilege-reduction mechanisms before executing the container process.
-
-### Capabilities
-
-Linux capabilities are dropped from the container process.
-
-The capability bounding set is also restricted so that dropped capabilities cannot simply be regained through later execution.
-
-### `no_new_privs`
-
-`PR_SET_NO_NEW_PRIVS` is enabled before execution.
-
-This prevents the process and its descendants from gaining additional privileges through mechanisms such as set-user-ID and set-group-ID executables or file capabilities.
-
-### Parent death handling
-
-The container process establishes parent-death handling so that it does not remain running independently if its supervising parent disappears.
-
-The implementation also accounts for the race between creating the child and configuring parent-death behaviour by checking that the expected parent remains alive.
-
-### Inherited file descriptors
-
-File descriptors inherited from the launching process are closed before `execve`.
-
-This prevents unrelated host descriptors from accidentally becoming available to the container process.
-
-## Failure model
-
-Container setup consists of multiple operations that can fail:
-
-```text
-clone
-  │
-  ├── namespace setup
-  ├── mount setup
-  ├── OverlayFS setup
-  ├── /dev setup
-  ├── /proc setup
-  ├── pivot_root
-  ├── configured mounts
-  └── security setup
-          │
-          ▼
-        execve
-```
-
-Failures during setup must not leave persistent container state behind.
-
-Temporary OverlayFS directories and mounts belong to the container lifecycle and are cleaned up when setup or execution fails.
-
-The runtime treats setup failure as a container creation failure rather than allowing a partially configured environment to continue running.
-
-## Design principles
-
-### Small
-
-The implementation should remain small enough to understand by reading the source.
-
-### Linux-native
-
-`cage` uses Linux primitives directly rather than recreating them behind a large abstraction layer.
-
-### Explicit
-
-Container behaviour should be visible in the code and configuration.
-
-### Disposable
-
-The normal container filesystem is ephemeral.
-
-### Host integration is explicit
-
-Host filesystem access is only introduced through explicitly configured bind mounts.
-
-### No daemon
-
-There is no background service managing containers.
-
-### No image management
-
-`cage` consumes an existing root filesystem. Creating, downloading, versioning, and distributing root filesystems are outside its scope.
-
-## Core invariants
-
-The following properties are fundamental to the design:
-
-1. The supplied rootfs is never used as the writable container layer.
-2. Normal container filesystem changes are stored in a temporary OverlayFS upper layer.
-3. Normal container filesystem changes disappear after teardown.
-4. Configured bind mounts are explicit exceptions and may modify host-backed storage.
-5. The container has its own mount namespace.
-6. The container has its own PID namespace.
-7. Container processes cannot retain arbitrary inherited file descriptors.
-8. Container privileges are reduced before execution.
-9. Temporary runtime state belongs to the container lifecycle.
-10. Container setup failure must not leave persistent temporary state behind.
-
-## Process model
-
-The host process acts as the container supervisor.
-
-Conceptually:
-
-```text
-host
- │
- └── cage
-      │
-      └── container process
-           │
-           ├── PID namespace
-           ├── mount namespace
-           ├── UTS namespace
-           ├── IPC namespace
-           └── network namespace
-```
-
-The container process eventually replaces itself with the requested executable using `execve`.
-
-There is no long-running runtime daemon.
-
-## Filesystem model
-
-The filesystem model can be reduced to three layers:
-
-```text
-             Host filesystem
-                   │
-          ┌────────┴────────┐
-          │                 │
-          ▼                 ▼
-      supplied rootfs   configured mounts
-       lower layer       host-backed paths
-          │                 │
-          ▼                 │
-       OverlayFS            │
-          │                 │
-          ▼                 │
-    temporary upper         │
-       + work               │
-          │                 │
-          └────────┬────────┘
-                   ▼
-             container root
-```
-
-The important distinction is that the OverlayFS upper layer is disposable, while configured bind mounts refer directly to host storage.
-
-## Complete model
-
-A useful way to think about `cage` is:
-
-```text
-                   configuration
-                         │
-                         ▼
-                    rootfs path
-                         │
-                         ▼
-                  supplied rootfs
-                         │
-                         ▼
-                    OverlayFS
-                  ┌──────┴──────┐
-                  │             │
-               lower          upper
-                  │          temporary
-                  │             │
-                  └──────┬──────┘
-                         │
-                         ▼
-                  container root
-                         │
-             ┌───────────┼───────────┐
-             │           │           │
-           /proc        /dev     bind mounts
-             │           │           │
-             └───────────┼───────────┘
-                         │
-                         ▼
-                    pivot_root
-                         │
-                         ▼
-                  security setup
-                         │
-                         ▼
-                       exec
-```
-
-Most of what happens inside the container therefore exists only for the lifetime of that process.
-
-The exception is anything intentionally exposed through a host-backed configured mount.
-
-## What cage is not
-
-`cage` intentionally does **not** provide:
-
-* images
-* registries
-* image distribution
-* container orchestration
-* networking management
-* persistent container storage
-* daemon management
-* a virtual machine
-* a general-purpose TOML implementation
-
-It does provide a small configuration file because filesystem and mount configuration are part of the runtime's explicit interface.
-
-## Project status
-
-`cage` is being developed incrementally through milestones.
-
-The current implementation covers the core container lifecycle, filesystem isolation, configuration-driven rootfs and mounts, and initial privilege reduction.
-
-Further hardening and reliability work remains before the runtime should be considered production-ready.
+The implementation deliberately keeps the number of components small.
 
 ## Building
 
-`cage` is built with the provided `Makefile`.
+Build:
 
 ```sh
 make
 ```
 
-The test suite can be built and run with:
+Run the test suite:
 
 ```sh
 make test
 ```
 
-A compiler with support for the required Linux interfaces is required.
-
-## Requirements
-
-`cage` currently targets Linux.
-
-It relies on Linux-specific functionality including:
+`cage` currently targets Linux and relies on Linux-specific interfaces including:
 
 * namespaces
 * `clone`
@@ -728,15 +322,47 @@ It relies on Linux-specific functionality including:
 * Linux capabilities
 * `prctl`
 * procfs
-* Linux device management
 
-It is therefore not intended to be portable to non-Linux operating systems.
+## Development
 
-## Philosophy
+Development is organised into implementation milestones.
 
-Containers are not magic.
+The current work covers:
 
-They are processes combined with a collection of kernel primitives:
+* basic container and namespace isolation
+* filesystem isolation
+* OverlayFS
+* configuration and bind mounts
+* privilege reduction
+* lifecycle handling
+* failure cleanup
+* security/property testing
+* inherited process-state sanitisation
+
+The next milestone focuses on resource limits, lifecycle races, filesystem hardening, and stress testing.
+
+See [`MILESTONES.md`](MILESTONES.md) for the current roadmap.
+
+## What cage is not
+
+`cage` does not provide:
+
+* container images
+* registries
+* image distribution
+* orchestration
+* networking management
+* persistent container storage
+* a container daemon
+* virtual machines
+
+A root filesystem is simply a directory supplied to the runtime.
+
+Creating, downloading, versioning, and distributing root filesystems are outside the scope of `cage`.
+
+## Design
+
+The core idea is deliberately simple:
 
 ```text
 namespaces
@@ -747,15 +373,13 @@ OverlayFS
     +
 pivot_root
     +
-capabilities
+privilege reduction
     +
 process lifecycle
     =
 container
 ```
 
-`cage` exists to keep that relationship visible.
+`cage` exists to make these Linux primitives explicit.
 
-The goal is not to compete with mature container engines.
-
-The goal is to understand, implement, and provide a small executable embodiment of the primitives that make Linux containers possible.
+The goal is not to replace mature container engines. The goal is to provide a small, understandable implementation of the mechanisms that make Linux containers possible.
