@@ -156,13 +156,17 @@ static int prepare_old_root(struct container *container)
     return 0;
 }
 
-static int pivot_root_to_overlay(struct container *container)
+static int pivot_root_to_overlay(struct container *container, int *pivoted)
 {
+    *pivoted = 0;
+
     if (chdir(container->overlay_root) == -1)
         return -1;
 
     if (syscall(SYS_pivot_root, ".", "oldroot") == -1)
         return -1;
+
+    *pivoted = 1;
 
     if (chdir("/") == -1)
         return -1;
@@ -1143,6 +1147,7 @@ static int child_main(void *arg)
 {
     struct child_context *ctx = arg;
     int                   status;
+    int                   pivoted;
 
     /*
      * Signals remain blocked until the parent has established the
@@ -1240,13 +1245,19 @@ static int child_main(void *arg)
      * root. Cleanup must therefore use paths relative to the new root
      * rather than container->overlay_root.
      */
-    if (pivot_root_to_overlay(ctx->container) == -1) {
+    pivoted = 0;
+
+    if (pivot_root_to_overlay(ctx->container, &pivoted) == -1) {
         perror("pivot root");
 
         close(ctx->work_fd);
         ctx->work_fd = -1;
 
-        cleanup_setup_mounts(ctx->container);
+        if (pivoted)
+            cleanup_mounts();
+        else
+            cleanup_setup_mounts(ctx->container);
+
         return 1;
     }
 

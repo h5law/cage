@@ -287,6 +287,70 @@ static int test_tmpfs(void)
     return 0;
 }
 
+static int test_tmpfs_setup_failure_cleanup(void)
+{
+    test_begin("tmpfs setup failure cleans up");
+
+    char config[PATH_MAX];
+    char rootfs[PATH_MAX];
+    char tmp_path[PATH_MAX];
+
+    if (make_config(config, sizeof(config)) < 0) {
+        test_fail("failed to create configuration");
+        return -1;
+    }
+
+    if (create_rootfs(probe_path, TEST_ROOTFS, rootfs, sizeof(rootfs)) < 0) {
+        unlink(config);
+        test_fail("failed to create rootfs");
+        return -1;
+    }
+
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s/tmp", rootfs) >=
+                ( int )sizeof(tmp_path) ||
+        write_file(tmp_path, "not-a-directory") < 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        test_fail("failed to create invalid /tmp");
+        return -1;
+    }
+
+    if (create_config(config, rootfs, NULL) < 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        test_fail("failed to create configuration");
+        return -1;
+    }
+
+    char *argv[] = {
+            ( char * )cage_path,
+            ( char * )"--config",
+            config,
+            ( char * )"/bin/probe",
+            ( char * )"exit",
+            ( char * )"0",
+            NULL,
+    };
+
+    int status = run_process(argv);
+
+    unlink(config);
+
+    if (status == 0) {
+        remove_tree(rootfs);
+        test_fail("container accepted invalid /tmp");
+        return -1;
+    }
+
+    if (remove_tree(rootfs) != 0) {
+        test_fail("rootfs could not be cleaned after tmpfs failure");
+        return -1;
+    }
+
+    test_pass();
+    return 0;
+}
+
 static int test_proc(void)
 {
     test_begin("/proc is a proc filesystem");
@@ -582,6 +646,63 @@ static int test_parent_death(void)
      * If cage survived the SIGKILL long enough to leave the child running,
      * the probe would retain the resources we subsequently tear down.
      */
+    test_pass();
+    return 0;
+}
+
+static int test_repeated_container_lifecycle(void)
+{
+    test_begin("repeated container creation and teardown");
+
+    for (int i = 0; i < 10; ++i) {
+        char config[PATH_MAX];
+        char rootfs[PATH_MAX];
+
+        if (make_config(config, sizeof(config)) < 0) {
+            test_fail("failed to create configuration");
+            return -1;
+        }
+
+        if (create_rootfs(probe_path, TEST_ROOTFS, rootfs, sizeof(rootfs)) <
+            0) {
+            unlink(config);
+            test_fail("failed to create rootfs");
+            return -1;
+        }
+
+        if (create_config(config, rootfs, NULL) < 0) {
+            unlink(config);
+            remove_tree(rootfs);
+            test_fail("failed to create configuration");
+            return -1;
+        }
+
+        char *argv[] = {
+                ( char * )cage_path,
+                ( char * )"--config",
+                config,
+                ( char * )"/bin/probe",
+                ( char * )"exit",
+                ( char * )"0",
+                NULL,
+        };
+
+        int status = run_process(argv);
+
+        unlink(config);
+
+        if (status != 0) {
+            remove_tree(rootfs);
+            test_fail("container lifecycle failed during repetition");
+            return -1;
+        }
+
+        if (remove_tree(rootfs) != 0) {
+            test_fail("rootfs cleanup failed after repetition");
+            return -1;
+        }
+    }
+
     test_pass();
     return 0;
 }
@@ -1194,6 +1315,8 @@ int main(int argc, char **argv)
     test_configured_readonly_mount();
     test_configured_mount_survives_teardown();
     test_configured_mount_failure_cleanup();
+    test_tmpfs_setup_failure_cleanup();
+    test_repeated_container_lifecycle();
 
     test_default_config();
     test_missing_config_argument();
