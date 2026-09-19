@@ -14,6 +14,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+static int probe_success(void) { return 0; }
+
 static int write_all(int fd, const char *buf, size_t len)
 {
     while (len > 0) {
@@ -242,6 +244,58 @@ static int probe_check_lock(const char *path)
     return 0;
 }
 
+static int probe_hold(const char *path)
+{
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+
+    if (fd == -1)
+        return 1;
+
+    if (flock(fd, LOCK_EX) == -1) {
+        close(fd);
+        return 1;
+    }
+
+    for (;;)
+        pause();
+}
+
+static int probe_hold_kill(const char *path)
+{
+    char marker[PATH_MAX];
+    int  fd;
+
+    if (snprintf(marker, sizeof(marker), "%s.started", path) >=
+        ( int )sizeof(marker))
+        return 1;
+
+    fd = open(path, O_RDWR | O_CREAT, 0644);
+
+    if (fd == -1)
+        return 1;
+
+    if (flock(fd, LOCK_EX) == -1) {
+        close(fd);
+        return 1;
+    }
+
+    int marker_fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    if (marker_fd == -1) {
+        close(fd);
+        return 1;
+    }
+
+    close(marker_fd);
+
+    usleep(500000);
+
+    kill(getpid(), SIGKILL);
+
+    close(fd);
+    return 1;
+}
+
 static int probe_pid(void)
 {
     printf("%ld\n", ( long )getpid());
@@ -458,6 +512,27 @@ int main(int argc, char **argv)
             return 1;
 
         return probe_check_lock(argv[2]);
+    }
+
+    if (strcmp(argv[1], "hold") == 0) {
+        if (argc != 3)
+            return 1;
+
+        return probe_hold(argv[2]);
+    }
+
+    if (strcmp(argv[1], "hold-kill") == 0) {
+        if (argc != 3)
+            return 1;
+
+        return probe_hold_kill(argv[2]);
+    }
+
+    if (strcmp(argv[1], "success") == 0) {
+        if (argc != 2)
+            return 1;
+
+        return probe_success();
     }
 
     if (strcmp(argv[1], "pid") == 0)
