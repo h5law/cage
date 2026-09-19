@@ -1,0 +1,3 @@
+[submodule "vendor/theft"]
+	path = vendor/theft
+	url = https://github.com/silentbicycle/theft.git

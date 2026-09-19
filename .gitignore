@@ -23,9 +23,6 @@ tests/property/test_config_property
 tests/property/test_config_whitespace_property
 tests/property/test_escape_property
 
-# Vendor
-vendor/
-
 # Demo
 demo.cast
 demo.gif
