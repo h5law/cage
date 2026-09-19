@@ -1010,7 +1010,6 @@ static int run_command(struct child_context *ctx)
          * Set the env variables for the child process to stop
          * the container inheriting the host env
          */
-        char *term = getenv("TERM");
         clearenv();
         setenv("PATH",
                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -1019,8 +1018,6 @@ static int run_command(struct child_context *ctx)
         setenv("USER", "root", 1);
         setenv("LOGNAME", "root", 1);
         setenv("LANG", "C.UTF-8", 1);
-        if (term != NULL)
-            setenv("TERM", term, 1);
 
         execvp(ctx->container->argv[0], ctx->container->argv);
 
