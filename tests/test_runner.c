@@ -588,11 +588,12 @@ static int test_parent_death(void)
 
 static int test_configured_writable_mount(void)
 {
-    test_begin("configured writable mount persists");
+    test_begin("configured writable mount is writable");
 
     char config[PATH_MAX];
     char rootfs[PATH_MAX];
     char mount_dir[PATH_MAX];
+    char source_file[PATH_MAX];
 
     if (make_config(config, sizeof(config)) < 0) {
         test_fail("failed to create configuration");
@@ -612,28 +613,48 @@ static int test_configured_writable_mount(void)
         return -1;
     }
 
-    FILE *fp = fopen(config, "w");
+    if (snprintf(source_file, sizeof(source_file), "%s/test", mount_dir) >=
+                ( int )sizeof(source_file) ||
+        write_file(source_file, "before") < 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to create source file");
+        return -1;
+    }
+
+    if (create_config(config, rootfs, NULL) < 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to create configuration");
+        return -1;
+    }
+
+    /*
+     * Append the configured writable bind mount.
+     */
+    FILE *fp = fopen(config, "a");
 
     if (fp == NULL) {
-        remove_tree(mount_dir);
-        remove_tree(rootfs);
         unlink(config);
-        test_fail("failed to write configuration");
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to open configuration");
         return -1;
     }
 
     if (fprintf(fp,
-                "rootfs = \"%s\"\n\n"
+                "\n"
                 "[[mounts]]\n"
                 "source = \"%s\"\n"
                 "target = \"/data\"\n",
-                rootfs, mount_dir) < 0 ||
+                mount_dir) < 0 ||
         fclose(fp) != 0) {
-        fclose(fp);
-        remove_tree(mount_dir);
-        remove_tree(rootfs);
         unlink(config);
-        test_fail("failed to write configuration");
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to append mount configuration");
         return -1;
     }
 
@@ -643,41 +664,29 @@ static int test_configured_writable_mount(void)
             config,
             ( char * )"/bin/probe",
             ( char * )"write-file",
-            ( char * )"/data/persistent",
-            ( char * )"persistent-data",
+            ( char * )"/data/test",
+            ( char * )"after",
             NULL,
     };
 
     int status = run_process(argv);
 
     if (status != 0) {
-        remove_tree(mount_dir);
-        remove_tree(rootfs);
         unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
         test_fail("cage failed to write through configured mount");
-        return -1;
-    }
-
-    char persistent[PATH_MAX];
-
-    if (snprintf(persistent, sizeof(persistent), "%s/persistent", mount_dir) >=
-        ( int )sizeof(persistent)) {
-        remove_tree(mount_dir);
-        remove_tree(rootfs);
-        unlink(config);
-        test_fail("persistent file path is too long");
         return -1;
     }
 
     char contents[128];
 
-    if (!file_exists(persistent) ||
-        read_file(persistent, contents, sizeof(contents)) < 0 ||
-        strcmp(contents, "persistent-data") != 0) {
-        remove_tree(mount_dir);
-        remove_tree(rootfs);
+    if (read_file(source_file, contents, sizeof(contents)) < 0 ||
+        strcmp(contents, "after") != 0) {
         unlink(config);
-        test_fail("configured writable mount did not persist data");
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("configured writable mount did not modify source");
         return -1;
     }
 
@@ -696,6 +705,7 @@ static int test_configured_readonly_mount(void)
     char config[PATH_MAX];
     char rootfs[PATH_MAX];
     char mount_dir[PATH_MAX];
+    char source_file[PATH_MAX];
 
     if (make_config(config, sizeof(config)) < 0) {
         test_fail("failed to create configuration");
@@ -715,41 +725,46 @@ static int test_configured_readonly_mount(void)
         return -1;
     }
 
-    char source_file[PATH_MAX];
-
-    if (snprintf(source_file, sizeof(source_file), "%s/original", mount_dir) >=
+    if (snprintf(source_file, sizeof(source_file), "%s/test", mount_dir) >=
                 ( int )sizeof(source_file) ||
         write_file(source_file, "original") < 0) {
-        remove_tree(mount_dir);
-        remove_tree(rootfs);
         unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
         test_fail("failed to create source file");
         return -1;
     }
 
-    FILE *fp = fopen(config, "w");
+    if (create_config(config, rootfs, NULL) < 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to create configuration");
+        return -1;
+    }
+
+    FILE *fp = fopen(config, "a");
 
     if (fp == NULL) {
-        remove_tree(mount_dir);
-        remove_tree(rootfs);
         unlink(config);
-        test_fail("failed to write configuration");
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to open configuration");
         return -1;
     }
 
     if (fprintf(fp,
-                "rootfs = \"%s\"\n\n"
+                "\n"
                 "[[mounts]]\n"
                 "source = \"%s\"\n"
                 "target = \"/data\"\n"
                 "readonly = true\n",
-                rootfs, mount_dir) < 0 ||
+                mount_dir) < 0 ||
         fclose(fp) != 0) {
-        fclose(fp);
-        remove_tree(mount_dir);
-        remove_tree(rootfs);
         unlink(config);
-        test_fail("failed to write configuration");
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to append mount configuration");
         return -1;
     }
 
@@ -759,7 +774,7 @@ static int test_configured_readonly_mount(void)
             config,
             ( char * )"/bin/probe",
             ( char * )"write-file",
-            ( char * )"/data/should-fail",
+            ( char * )"/data/test",
             ( char * )"must-not-write",
             NULL,
     };
@@ -767,16 +782,21 @@ static int test_configured_readonly_mount(void)
     int status = run_process(argv);
 
     char contents[128];
-    int  unchanged = file_exists(source_file) &&
-                     read_file(source_file, contents, sizeof(contents)) == 0 &&
-                     strcmp(contents, "original") == 0;
+
+    int unchanged = read_file(source_file, contents, sizeof(contents)) == 0 &&
+                    strcmp(contents, "original") == 0;
 
     unlink(config);
     remove_tree(rootfs);
     remove_tree(mount_dir);
 
-    if (status == 0 || !unchanged) {
+    if (status == 0) {
         test_fail("read-only mount allowed the write");
+        return -1;
+    }
+
+    if (!unchanged) {
+        test_fail("read-only mount modified the host source");
         return -1;
     }
 
@@ -784,13 +804,14 @@ static int test_configured_readonly_mount(void)
     return 0;
 }
 
-static int test_configured_mount_failure_cleanup(void)
+static int test_configured_mount_survives_teardown(void)
 {
-    test_begin("configured mount failure cleans up");
+    test_begin("configured mount data survives container teardown");
 
     char config[PATH_MAX];
     char rootfs[PATH_MAX];
-    char runtime[PATH_MAX];
+    char mount_dir[PATH_MAX];
+    char persistent[PATH_MAX];
 
     if (make_config(config, sizeof(config)) < 0) {
         test_fail("failed to create configuration");
@@ -803,34 +824,164 @@ static int test_configured_mount_failure_cleanup(void)
         return -1;
     }
 
-    if (make_temp_dir(TEST_RUNTIME, runtime, sizeof(runtime)) < 0) {
+    if (make_temp_dir(TEST_MOUNT, mount_dir, sizeof(mount_dir)) < 0) {
         unlink(config);
         remove_tree(rootfs);
-        test_fail("failed to create runtime directory");
+        test_fail("failed to create mount source");
         return -1;
     }
 
+    if (snprintf(persistent, sizeof(persistent), "%s/persistent", mount_dir) >=
+        ( int )sizeof(persistent)) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("persistent path is too long");
+        return -1;
+    }
+
+    if (create_config(config, rootfs, NULL) < 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to create configuration");
+        return -1;
+    }
+
+    FILE *fp = fopen(config, "a");
+
+    if (fp == NULL) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to open configuration");
+        return -1;
+    }
+
+    if (fprintf(fp,
+                "\n"
+                "[[mounts]]\n"
+                "source = \"%s\"\n"
+                "target = \"/data\"\n",
+                mount_dir) < 0 ||
+        fclose(fp) != 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to append mount configuration");
+        return -1;
+    }
+
+    char *argv[] = {
+            ( char * )cage_path,
+            ( char * )"--config",
+            config,
+            ( char * )"/bin/probe",
+            ( char * )"write-file",
+            ( char * )"/data/persistent",
+            ( char * )"persistent-data",
+            NULL,
+    };
+
+    int status = run_process(argv);
+
+    /*
+     * Cage must have completely exited before the host-backed source
+     * is inspected. This verifies that the data is not part of the
+     * ephemeral OverlayFS layer.
+     */
+    if (status != 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("container failed before teardown");
+        return -1;
+    }
+
+    char contents[128];
+
+    if (!file_exists(persistent) ||
+        read_file(persistent, contents, sizeof(contents)) < 0 ||
+        strcmp(contents, "persistent-data") != 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("mounted data did not survive container teardown");
+        return -1;
+    }
+
+    unlink(config);
+    remove_tree(rootfs);
+    remove_tree(mount_dir);
+
+    test_pass();
+    return 0;
+}
+
+static int test_configured_mount_failure_cleanup(void)
+{
+    test_begin("configured mount failure cleans up");
+
+    char config[PATH_MAX];
+    char rootfs[PATH_MAX];
+    char first_mount[PATH_MAX];
+    char missing_mount[PATH_MAX];
+
+    if (make_config(config, sizeof(config)) < 0) {
+        test_fail("failed to create configuration");
+        return -1;
+    }
+
+    if (create_rootfs(probe_path, TEST_ROOTFS, rootfs, sizeof(rootfs)) < 0) {
+        unlink(config);
+        test_fail("failed to create rootfs");
+        return -1;
+    }
+
+    if (make_temp_dir(TEST_MOUNT, first_mount, sizeof(first_mount)) < 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        test_fail("failed to create first mount source");
+        return -1;
+    }
+
+    if (snprintf(missing_mount, sizeof(missing_mount), "%s/missing-source",
+                 first_mount) >= ( int )sizeof(missing_mount)) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(first_mount);
+        test_fail("missing mount path is too long");
+        return -1;
+    }
+
+    /*
+     * The first mount is valid. The second mount deliberately fails.
+     * This ensures setup has already acquired a mount before entering
+     * the failure path.
+     */
     FILE *fp = fopen(config, "w");
 
     if (fp == NULL) {
-        remove_tree(runtime);
-        remove_tree(rootfs);
         unlink(config);
-        test_fail("failed to write configuration");
+        remove_tree(rootfs);
+        remove_tree(first_mount);
+        test_fail("failed to create configuration");
         return -1;
     }
 
     if (fprintf(fp,
                 "rootfs = \"%s\"\n\n"
                 "[[mounts]]\n"
-                "source = \"%s/missing-mount-source\"\n"
-                "target = \"/data\"\n",
-                rootfs, runtime) < 0 ||
+                "source = \"%s\"\n"
+                "target = \"/first\"\n\n"
+                "[[mounts]]\n"
+                "source = \"%s\"\n"
+                "target = \"/second\"\n",
+                rootfs, first_mount, missing_mount) < 0 ||
         fclose(fp) != 0) {
-        fclose(fp);
-        remove_tree(runtime);
-        remove_tree(rootfs);
         unlink(config);
+        remove_tree(rootfs);
+        remove_tree(first_mount);
         test_fail("failed to write configuration");
         return -1;
     }
@@ -851,20 +1002,18 @@ static int test_configured_mount_failure_cleanup(void)
     remove_tree(rootfs);
 
     if (status == 0) {
-        remove_tree(runtime);
-        test_fail("invalid mount was accepted");
+        remove_tree(first_mount);
+        test_fail("container accepted the invalid mount");
         return -1;
     }
 
     /*
-     * The runtime directory is deliberately removed only after cage has
-     * exited. If cage leaked a mount of the runtime tree, removal would
-     * fail or leave contents behind.
+     * The source directory belongs to the host namespace. If the
+     * configured mount leaked out of the container namespace, it
+     * would still be busy here and removal would fail.
      */
-    int cleanup_status = remove_tree(runtime);
-
-    if (cleanup_status != 0) {
-        test_fail("mount failure did not clean up");
+    if (remove_tree(first_mount) != 0) {
+        test_fail("configured mount remained after setup failure");
         return -1;
     }
 
@@ -1043,6 +1192,7 @@ int main(int argc, char **argv)
 
     test_configured_writable_mount();
     test_configured_readonly_mount();
+    test_configured_mount_survives_teardown();
     test_configured_mount_failure_cleanup();
 
     test_default_config();

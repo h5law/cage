@@ -121,10 +121,10 @@ Move runtime configuration out of positional CLI arguments and into a configurat
 * [x] Test malformed configuration
 * [x] Test invalid rootfs configuration
 * [x] Test invalid mount configuration
-* [ ] Test configured writable mounts
-* [ ] Test configured read-only mounts
-* [ ] Test configured mounts survive container teardown
-* [ ] Audit configured-mount failure cleanup
+* [x] Test configured writable mounts
+* [x] Test configured read-only mounts
+* [x] Test configured mounts survive container teardown
+* [x] Audit configured-mount failure cleanup
 
 ### Documentation
 
@@ -170,11 +170,11 @@ Make container setup and teardown robust against failures and hostile conditions
 
 * [ ] Handle missing OverlayFS support
 * [ ] Handle unusable rootfs permissions
-* [ ] Handle failure during mount setup
-* [ ] Handle failure during `pivot_root`
-* [ ] Handle failure during `/dev` setup
-* [ ] Handle failure during `/proc` setup
-* [ ] Handle failure during configured mount setup
+* [x] Handle failure during mount setup
+* [x] Handle failure during `pivot_root`
+* [x] Handle failure during `/dev` setup
+* [x] Handle failure during `/proc` setup
+* [x] Handle failure during configured mount setup
 * [ ] Verify cleanup after every setup failure
 * [ ] Verify no runtime-directory leaks
 * [ ] Verify no mount leaks
@@ -191,6 +191,7 @@ Make container setup and teardown robust against failures and hostile conditions
 * [x] Add generated path traversal coverage
 * [x] Add generated namespace and proc/sys path coverage
 * [x] Add timeout handling for hostile or hanging security probes
+* [x] Add configured mount failure cleanup regression test
 * [ ] Add hardening regression tests where appropriate
 * [ ] Add failure-path regression tests
 * [ ] Add teardown regression tests

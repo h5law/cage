@@ -368,6 +368,81 @@ static int mount_configured_mounts(const struct container *container)
     return 0;
 }
 
+static int cleanup_configured_mounts(const struct container *container)
+{
+    const struct cage_config *config = container->config;
+
+    for (size_t i = config->mount_count; i > 0; --i) {
+        const struct mount_config *mount_config = &config->mounts[i - 1];
+        char                       target[PATH_MAX];
+
+        if (snprintf(target, sizeof(target), "%s%s", container->overlay_root,
+                     mount_config->target) >= ( int )sizeof(target)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+
+        if (umount2(target, MNT_DETACH) == -1 && errno != EINVAL &&
+            errno != ENOENT) {
+            fprintf(stderr,
+                    "cage: failed to unmount configured mount '%s': %s\n",
+                    mount_config->target, strerror(errno));
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static void cleanup_setup_mounts(struct container *container)
+{
+    static const char *const devices[] = {
+            "null", "zero", "random", "urandom", "tty",
+    };
+
+    if (cleanup_configured_mounts(container) == -1)
+        perror("cleanup configured mounts");
+
+    for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); ++i) {
+        char path[PATH_MAX];
+
+        if (snprintf(path, sizeof(path), "%s/dev/%s", container->overlay_root,
+                     devices[i]) >= ( int )sizeof(path)) {
+            continue;
+        }
+
+        if (umount2(path, MNT_DETACH) == -1 && errno != EINVAL &&
+            errno != ENOENT)
+            perror("cleanup device mount");
+    }
+
+    {
+        char path[PATH_MAX];
+
+        if (snprintf(path, sizeof(path), "%s/dev", container->overlay_root) <
+            ( int )sizeof(path)) {
+            if (umount2(path, MNT_DETACH) == -1 && errno != EINVAL &&
+                errno != ENOENT)
+                perror("cleanup dev");
+        }
+    }
+
+    {
+        char path[PATH_MAX];
+
+        if (snprintf(path, sizeof(path), "%s/proc", container->overlay_root) <
+            ( int )sizeof(path)) {
+            if (umount2(path, MNT_DETACH) == -1 && errno != EINVAL &&
+                errno != ENOENT)
+                perror("cleanup proc");
+        }
+    }
+
+    if (umount2(container->overlay_root, MNT_DETACH) == -1 && errno != EINVAL &&
+        errno != ENOENT)
+        perror("cleanup overlay root");
+}
+
 static int cleanup_mounts(void)
 {
     static const char *const devices[] = {
@@ -1103,6 +1178,11 @@ static int child_main(void *arg)
     if (make_mounts_private() == -1)
         return 1;
 
+    /*
+     * From this point onwards the child owns an OverlayFS mount.
+     * Every failure before pivot_root() must explicitly unwind the
+     * mounts created during container setup.
+     */
     if (mount_overlay(ctx->container) == -1) {
         perror("mount overlay");
         return 1;
@@ -1110,16 +1190,19 @@ static int child_main(void *arg)
 
     if (mount_proc(ctx->container) == -1) {
         perror("mount proc");
+        cleanup_setup_mounts(ctx->container);
         return 1;
     }
 
     if (setup_dev(ctx->container) == -1) {
         perror("mount and setup /dev");
+        cleanup_setup_mounts(ctx->container);
         return 1;
     }
 
     if (prepare_old_root(ctx->container) == -1) {
         perror("prepare old root");
+        cleanup_setup_mounts(ctx->container);
         return 1;
     }
 
@@ -1128,41 +1211,62 @@ static int child_main(void *arg)
 
     if (ctx->work_fd == -1) {
         perror("open overlay work directory");
+        cleanup_setup_mounts(ctx->container);
         return 1;
     }
 
     if (prepare_mount_targets(ctx->container) == -1) {
         perror("prepare configured mount targets");
+
         close(ctx->work_fd);
         ctx->work_fd = -1;
+
+        cleanup_setup_mounts(ctx->container);
         return 1;
     }
 
     if (mount_configured_mounts(ctx->container) == -1) {
         perror("mount configured mounts");
+
         close(ctx->work_fd);
         ctx->work_fd = -1;
+
+        cleanup_setup_mounts(ctx->container);
         return 1;
     }
 
+    /*
+     * After pivot_root() succeeds, the overlay becomes the container
+     * root. Cleanup must therefore use paths relative to the new root
+     * rather than container->overlay_root.
+     */
     if (pivot_root_to_overlay(ctx->container) == -1) {
         perror("pivot root");
+
         close(ctx->work_fd);
         ctx->work_fd = -1;
+
+        cleanup_setup_mounts(ctx->container);
         return 1;
     }
 
     if (mount_tmpfs() == -1) {
         perror("mount tmpfs");
+
         close(ctx->work_fd);
         ctx->work_fd = -1;
+
+        cleanup_mounts();
         return 1;
     }
 
     if (install_command_signal_handlers() == -1) {
         perror("install signal handlers");
+
         close(ctx->work_fd);
         ctx->work_fd = -1;
+
+        cleanup_mounts();
         return 1;
     }
 
