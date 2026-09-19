@@ -116,11 +116,11 @@ Move runtime configuration out of positional CLI arguments and into a configurat
 
 ### Testing
 
-* [ ] Add configuration parser regression tests
-* [ ] Test missing configuration files
-* [ ] Test malformed configuration
-* [ ] Test invalid rootfs configuration
-* [ ] Test invalid mount configuration
+* [x] Add configuration parser property tests
+* [x] Test missing configuration files
+* [x] Test malformed configuration
+* [x] Test invalid rootfs configuration
+* [x] Test invalid mount configuration
 * [ ] Test configured writable mounts
 * [ ] Test configured read-only mounts
 * [ ] Test configured mounts survive container teardown
@@ -150,6 +150,14 @@ Make container setup and teardown robust against failures and hostile conditions
 
 ### Filesystem and runtime hardening
 
+* [x] Add property-based security testing
+* [x] Exercise filesystem path traversal and escape surfaces
+* [x] Exercise procfs and sysfs access surfaces
+* [x] Exercise namespace-related escape surfaces
+* [x] Exercise mount and mount-namespace operations
+* [x] Exercise device access surfaces
+* [x] Exercise capability and privilege-related operations
+* [x] Exercise process-control surfaces such as `ptrace` and `kill`
 * [ ] Restrict remaining filesystem/device access further
 * [ ] Review namespace-specific privilege boundaries
 * [ ] Audit inherited process state
@@ -172,8 +180,17 @@ Make container setup and teardown robust against failures and hostile conditions
 * [ ] Verify no mount leaks
 * [ ] Verify no child-process leaks
 
-### Regression tests
+### Regression & property testing
 
+* [x] Add configuration property tests
+* [x] Add configuration formatting-invariance tests
+* [x] Add configuration invalid-input tests
+* [x] Add configuration whitespace tests
+* [x] Add configuration literal-value tests
+* [x] Add property-based escape testing
+* [x] Add generated path traversal coverage
+* [x] Add generated namespace and proc/sys path coverage
+* [x] Add timeout handling for hostile or hanging security probes
 * [ ] Add hardening regression tests where appropriate
 * [ ] Add failure-path regression tests
 * [ ] Add teardown regression tests
