@@ -228,6 +228,29 @@ static int probe_orphan(int uncooperative)
     return 0;
 }
 
+static int probe_orphan_hold(const char *path)
+{
+    pid_t pid = fork();
+
+    if (pid == -1)
+        return 1;
+
+    if (pid == 0) {
+        int fd = open(path, O_RDWR | O_CREAT, 0644);
+
+        if (fd == -1)
+            _exit(1);
+
+        if (flock(fd, LOCK_EX) == -1)
+            _exit(1);
+
+        for (;;)
+            pause();
+    }
+
+    return 0;
+}
+
 static int probe_check_lock(const char *path)
 {
     int fd = open(path, O_RDWR | O_CREAT, 0644);
@@ -515,6 +538,13 @@ int main(int argc, char **argv)
             return 1;
 
         return probe_hold_kill(argv[2]);
+    }
+
+    if (strcmp(argv[1], "orphan-hold") == 0) {
+        if (argc != 3)
+            return 1;
+
+        return probe_orphan_hold(argv[2]);
     }
 
     if (strcmp(argv[1], "success") == 0) {

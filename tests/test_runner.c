@@ -1018,6 +1018,130 @@ static int test_abnormal_child_termination(void)
     return 0;
 }
 
+static int test_child_process_cleanup(void)
+{
+    test_begin("descendant processes are cleaned up");
+
+    char config[PATH_MAX];
+    char rootfs[PATH_MAX];
+    char mount_dir[PATH_MAX];
+    char lock_path[PATH_MAX];
+
+    if (make_config(config, sizeof(config)) < 0) {
+        test_fail("failed to create configuration");
+        return -1;
+    }
+
+    if (create_rootfs(probe_path, TEST_ROOTFS, rootfs, sizeof(rootfs)) < 0) {
+        unlink(config);
+        test_fail("failed to create rootfs");
+        return -1;
+    }
+
+    if (make_temp_dir(TEST_MOUNT, mount_dir, sizeof(mount_dir)) < 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        test_fail("failed to create mount source");
+        return -1;
+    }
+
+    if (snprintf(lock_path, sizeof(lock_path), "%s/lock", mount_dir) >=
+        ( int )sizeof(lock_path)) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("lock path is too long");
+        return -1;
+    }
+
+    FILE *fp = fopen(config, "w");
+
+    if (fp == NULL) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to create configuration");
+        return -1;
+    }
+
+    if (fprintf(fp,
+                "rootfs = \"%s\"\n\n"
+                "[[mounts]]\n"
+                "source = \"%s\"\n"
+                "target = \"/state\"\n",
+                rootfs, mount_dir) < 0 ||
+        fclose(fp) != 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to write configuration");
+        return -1;
+    }
+
+    char *argv[] = {
+            ( char * )cage_path,
+            ( char * )"--config",
+            config,
+            ( char * )"/bin/probe",
+            ( char * )"orphan-hold",
+            ( char * )"/state/lock",
+            NULL,
+    };
+
+    int status = run_process(argv);
+
+    if (status != 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("container did not exit normally");
+        return -1;
+    }
+
+    int lock_fd = open(lock_path, O_RDWR | O_CREAT, 0644);
+
+    if (lock_fd == -1) {
+        unlink(config);
+        remove_tree(rootfs);
+        remove_tree(mount_dir);
+        test_fail("failed to open host lock");
+        return -1;
+    }
+
+    bool lock_released = false;
+
+    for (int i = 0; i < 20; ++i) {
+        if (flock(lock_fd, LOCK_EX | LOCK_NB) == 0) {
+            lock_released = true;
+            flock(lock_fd, LOCK_UN);
+            break;
+        }
+
+        if (errno != EWOULDBLOCK && errno != EAGAIN)
+            break;
+
+        usleep(100000);
+    }
+
+    close(lock_fd);
+
+    unlink(config);
+    remove_tree(rootfs);
+
+    if (remove_tree(mount_dir) != 0) {
+        test_fail("descendant retained the mounted source");
+        return -1;
+    }
+
+    if (!lock_released) {
+        test_fail("descendant process survived container teardown");
+        return -1;
+    }
+
+    test_pass();
+    return 0;
+}
+
 static int test_repeated_container_lifecycle(void)
 {
     test_begin("repeated container creation and teardown");
@@ -2036,6 +2160,7 @@ int main(int argc, char **argv)
     test_invalid_rootfs();
     test_parent_death();
     test_abnormal_child_termination();
+    test_child_process_cleanup();
     test_mount_cleanup_after_normal_exit();
     test_mount_cleanup_after_abnormal_exit();
 

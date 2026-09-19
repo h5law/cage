@@ -164,7 +164,7 @@ Make container setup and teardown robust against failures and hostile conditions
 * [ ] Audit signal-handling edge cases
 * [ ] Audit mount propagation behaviour
 * [ ] Verify no host mounts are unintentionally exposed
-* [ ] Verify configured read-only mounts cannot be written from the container
+* [x] Verify configured read-only mounts cannot be written from the container
 
 ### Failure handling
 
@@ -177,8 +177,8 @@ Make container setup and teardown robust against failures and hostile conditions
 * [x] Handle failure during configured mount setup
 * [x] Verify cleanup after every setup failure
 * [x] Verify no runtime-directory leaks
-* [ ] Verify no mount leaks
-* [ ] Verify no child-process leaks
+* [x] Verify no mount leaks
+* [x] Verify no child-process leaks
 
 ### Regression & property testing
 
@@ -196,7 +196,7 @@ Make container setup and teardown robust against failures and hostile conditions
 * [ ] Add failure-path regression tests
 * [ ] Add teardown regression tests
 * [x] Verify repeated container creation and teardown
-* [ ] Verify abnormal child termination is cleaned up correctly
+* [x] Verify abnormal child termination is cleaned up correctly
 
 ## Milestone 6 — Review & Release
 
@@ -220,7 +220,7 @@ Bring the implementation and documentation into a coherent first release.
 * [ ] Run tests from a clean build
 * [ ] Verify tests do not depend on the developer's environment
 * [ ] Verify temporary files and mounts are cleaned up
-* [ ] Verify configured mounts behave as documented
+* [x] Verify configured mounts behave as documented
 * [ ] Verify supplied rootfs remains unchanged
 * [ ] Verify ordinary container changes are ephemeral
 
