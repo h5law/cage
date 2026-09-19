@@ -15,6 +15,22 @@ OBJECTS := $(SOURCES:.c=.o)
 TEST_RUNNER := tests/test_runner
 TEST_PROBE := tests/container_probe
 TEST_CONFIG := tests/test_config
+TEST_ESCAPE_RUNNER := tests/escape/escape_runner
+TEST_ESCAPE_PROBE := tests/escape/escape_probe
+
+$(TEST_ESCAPE_PROBE): tests/escape/escape_probe.c
+	$(CC) $(CFLAGS) $< -static -o $@
+
+$(TEST_ESCAPE_RUNNER): tests/escape/escape_runner.c \
+                       tests/escape/escape_utils.c \
+                       tests/escape/escape_utils.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		tests/escape/escape_runner.c \
+		tests/escape/escape_utils.c \
+		-o $@
+
+test-escape: $(TARGET) $(TEST_ESCAPE_RUNNER) $(TEST_ESCAPE_PROBE)
+	./$(TEST_ESCAPE_RUNNER) ./$(TARGET) ./$(TEST_ESCAPE_PROBE)
 
 $(TARGET): $(OBJECTS)
 	$(CC) $(CFLAGS) $(OBJECTS) -o $@
@@ -39,6 +55,12 @@ test: $(TARGET) $(TEST_RUNNER) $(TEST_PROBE) $(TEST_CONFIG)
 	./$(TEST_RUNNER) ./$(TARGET) ./$(TEST_PROBE)
 
 clean:
-	rm -f $(OBJECTS) $(TARGET) $(TEST_RUNNER) $(TEST_PROBE) $(TEST_CONFIG)
+	rm -f $(OBJECTS) \
+		$(TARGET) \
+		$(TEST_RUNNER) \
+		$(TEST_PROBE) \
+		$(TEST_CONFIG) \
+		$(TEST_ESCAPE_RUNNER) \
+		$(TEST_ESCAPE_PROBE)
 
 .PHONY: clean test test-config

@@ -14,6 +14,8 @@ rootfs/
 tests/test_runner
 tests/container_probe
 tests/test_config
+tests/escape/escape_probe
+tests/escape/escape_runner
 
 # Demo
 demo.cast

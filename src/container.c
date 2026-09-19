@@ -1351,13 +1351,14 @@ int container_run(struct container *container)
         return -1;
     }
 
-    ctx.parent_fd  = parent_fd;
-    stack_top      = stack + STACK_SIZE;
+    ctx.parent_fd = parent_fd;
+    stack_top     = stack + STACK_SIZE;
 
-    container->pid = clone(child_main, stack_top,
-                           CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS |
-                                   CLONE_NEWNET | CLONE_NEWIPC | SIGCHLD,
-                           &ctx);
+    container->pid =
+            clone(child_main, stack_top,
+                  CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET |
+                          CLONE_NEWIPC | CLONE_NEWUTS | SIGCHLD,
+                  &ctx);
 
     /*
      * The parent no longer needs either of these descriptors.
