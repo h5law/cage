@@ -1,129 +1,227 @@
-# cage - Milestones
+# cage — Implementation Milestones
 
-## Milestone 1 — Basic CLI & Container
+This document tracks the implementation of `cage` from a minimal container launcher towards a small, hardened Linux container runtime.
 
-- [x] Create basic `cage <rootfs> <command> [args...]` CLI
-- [x] Validate that the supplied rootfs exists and is a directory
-- [x] Create initial container process
-- [x] Execute a command inside the container
-- [x] Propagate the command's exit status
-- [x] Add basic test runner and container probe
-- [x] Add invalid-rootfs testing
+The milestones are ordered so that each stage builds on the previous one.
 
-## Milestone 2 — Namespace Lifecycle
+## Milestone 1 — Basic Container
 
-- [x] Create container with `clone()`
-- [x] Create user namespace
-- [x] Create PID namespace
-- [x] Create mount namespace
-- [x] Create network namespace
-- [x] Create IPC namespace
-- [x] Establish UID mapping
-- [x] Establish GID mapping
-- [x] Synchronise parent and child during namespace setup
-- [x] Make container mounts private
-- [x] `chroot()` into the supplied rootfs
-- [x] Set up `/proc`
-- [x] Set up private `/tmp`
-- [x] Set up private `/dev`
-- [x] Forward relevant signals
-- [x] Supervise the workload
-- [x] Reap the container process
-- [x] Terminate container descendants during cleanup
-- [x] Handle parent death
-- [x] Test PID namespace isolation
-- [x] Test user namespace isolation
-- [x] Test mount namespace isolation
-- [x] Test network namespace isolation
-- [x] Test IPC namespace isolation
-- [x] Test `/proc`
-- [x] Test `/tmp`
-- [x] Test `/dev`
-- [x] Test descendant cleanup
-- [x] Test forced/uncooperative descendant cleanup
+Build the smallest useful container around Linux namespaces.
 
-## Milestone 3 — OverlayFS & Filesystem Isolation
+* [x] Implement basic CLI
+* [x] Accept an executable and arguments
+* [x] Create a child process with `clone`
+* [x] Create PID namespace
+* [x] Create mount namespace
+* [x] Create UTS namespace
+* [x] Create IPC namespace
+* [x] Create network namespace
+* [x] Configure a private hostname
+* [x] Establish basic mount isolation
+* [x] Implement `execve` of the requested process
+* [x] Add basic error handling
+* [x] Add initial test runner
+* [x] Add container probe executable
 
-- [x] Create private runtime directory
-- [x] Exclusively lock the runtime directory
-- [x] Create OverlayFS upper directory
-- [x] Create OverlayFS work directory
-- [x] Create OverlayFS root directory
-- [x] Mount supplied rootfs as OverlayFS lower layer
-- [x] Mount OverlayFS as the container root
-- [x] Create `oldroot` mountpoint
-- [x] `pivot_root()` into the OverlayFS root
-- [x] Detach the original root
-- [x] Keep the OverlayFS work directory available for cleanup
-- [x] Mount private `/tmp`
-- [x] Construct private `/dev`
-- [x] Mount container `/proc`
-- [x] Clean up device mounts
-- [x] Clean up `/tmp`
-- [x] Clean up `/dev`
-- [x] Clean up `/proc`
-- [x] Clean up the detached root
-- [x] Clean up OverlayFS runtime directories
-- [x] Remove the private runtime directory
-- [x] Drop container capabilities
-- [x] Set `no_new_privs`
-- [x] Close inherited file descriptors before executing the workload
-- [x] Add regression test for FD inheritance
-- [ ] Test that files created inside the container disappear after teardown
-- [ ] Test that modifications to existing files do not modify the supplied rootfs
-- [ ] Test that deleted lower-layer files remain deleted only inside the container
-- [ ] Test that the supplied rootfs is unchanged after container exit
-- [ ] Test OverlayFS cleanup after normal command exit
-- [ ] Test OverlayFS cleanup after forced termination
-- [ ] Test cleanup when container setup fails part-way through
-- [ ] Audit all OverlayFS and mount error paths
+## Milestone 2 — Namespace Identity & Process Isolation
 
-## Milestone 4 — Container Hardening
+Make the container's process and namespace identity explicit and testable.
 
-- [x] Drop Linux capabilities
-- [x] Drop capability bounding set
-- [x] Set `no_new_privs`
-- [x] Establish parent-death handling
-- [x] Verify parent liveness across the clone/`prctl()` race
-- [x] Close inherited descriptors before `execve()`
-- [ ] Restrict remaining filesystem/device access further
-- [ ] Review namespace-specific privilege boundaries
-- [ ] Audit inherited process state
-- [ ] Audit signal-handling edge cases
-- [ ] Add hardening regression tests where appropriate
+* [x] Verify container process is PID 1
+* [x] Verify host and container have different PID namespaces
+* [x] Verify hostname isolation
+* [x] Verify mount namespace isolation
+* [x] Verify IPC namespace isolation
+* [x] Verify network namespace isolation
+* [x] Verify namespace membership through `/proc`
+* [x] Ensure child lifecycle is correctly supervised
+* [x] Handle child exit status
+* [x] Handle child termination by signal
+* [x] Add namespace identity regression tests
 
-## Milestone 5 — Reliability & Edge Cases
+## Milestone 3 — Filesystem Isolation
 
-- [x] Test normal command exit
-- [x] Test non-zero command exit
-- [x] Test command termination by signal
-- [x] Test descendant processes
-- [x] Test uncooperative descendants
-- [x] Test parent death
-- [x] Test command `execve()` failure
-- [x] Test invalid rootfs
-- [ ] Test missing OverlayFS support
-- [ ] Test unusable rootfs permissions
-- [ ] Test failure during mount setup
-- [ ] Test failure during `pivot_root()`
-- [ ] Test failure during `/dev` setup
-- [ ] Test failure during `/proc` setup
-- [ ] Verify cleanup after every setup failure
-- [ ] Verify no runtime-directory leaks
-- [ ] Verify no mount leaks
-- [ ] Verify no child-process leaks
+Replace the host filesystem view with an isolated container filesystem.
 
-## Milestone 6 — Documentation & Release
+### Root filesystem
 
-- [ ] Complete the implementation review
-- [ ] Clean up and simplify the code where appropriate
-- [ ] Run the complete test suite from a clean build
-- [ ] Update the README to reflect the current implementation
-- [ ] Document rootfs requirements
-- [ ] Document OverlayFS behaviour
-- [ ] Document container lifecycle
-- [ ] Document security model and limitations
-- [ ] Review project structure and build instructions
-- [ ] Finalize commit history
-- [ ] Open the final pull request
-- [ ] Tag the first release
+* [x] Require a supplied rootfs
+* [x] Validate that the rootfs exists
+* [x] Validate that the rootfs is a directory
+* [x] Prepare a private runtime directory
+* [x] Mount the supplied rootfs through OverlayFS
+* [x] Configure OverlayFS lower, upper, and work directories
+* [x] Perform `pivot_root`
+* [x] Detach the old root
+* [x] Remove the old root mount
+* [x] Clean up temporary runtime directories
+
+### `/proc`
+
+* [x] Mount a private proc filesystem
+* [x] Mount `/proc` after entering the container root
+* [x] Ensure `/proc` reflects the container PID namespace
+
+### `/dev`
+
+* [x] Create a private `/dev`
+* [x] Mount a private devtmpfs
+* [x] Provide required basic devices
+* [x] Mount `/dev/null`
+* [x] Mount `/dev/zero`
+* [x] Mount `/dev/random`
+* [x] Mount `/dev/urandom`
+* [x] Mount `/dev/tty`
+
+### OverlayFS behaviour
+
+* [ ] Test files created inside the container disappear after teardown
+* [ ] Test modifications do not alter the supplied rootfs
+* [ ] Test deletions remain confined to the container
+* [ ] Verify the supplied rootfs is unchanged after normal execution
+* [ ] Test OverlayFS cleanup after normal exit
+* [ ] Test OverlayFS cleanup after forced termination
+* [ ] Test cleanup when filesystem setup fails
+* [ ] Audit OverlayFS and mount error paths
+
+## Milestone 4 — Configuration & Mounts
+
+Move runtime configuration out of positional CLI arguments and into a configuration file.
+
+### Configuration
+
+* [x] Define configuration structure
+* [x] Implement configuration file loading
+* [x] Implement default `cage.toml` discovery
+* [x] Implement `--config <path>`
+* [x] Validate required `rootfs`
+* [x] Reject missing required fields
+* [x] Reject duplicate fields
+* [x] Reject unknown configuration settings
+* [x] Reject invalid mount tables
+* [x] Implement configuration cleanup
+* [x] Add example configuration
+
+### Configured mounts
+
+* [x] Define `[[mounts]]`
+* [x] Support `source`
+* [x] Support `target`
+* [x] Support `readonly`
+* [x] Validate absolute mount targets
+* [x] Create mount targets where required
+* [x] Bind mount configured host paths
+* [x] Support read-only bind mounts
+* [x] Mount configured paths on top of the OverlayFS root
+
+### Testing
+
+* [ ] Add configuration parser regression tests
+* [ ] Test missing configuration files
+* [ ] Test malformed configuration
+* [ ] Test invalid rootfs configuration
+* [ ] Test invalid mount configuration
+* [ ] Test configured writable mounts
+* [ ] Test configured read-only mounts
+* [ ] Test configured mounts survive container teardown
+* [ ] Audit configured-mount failure cleanup
+
+### Documentation
+
+* [x] Update README for configuration-driven usage
+* [x] Document rootfs configuration
+* [x] Document configured bind mounts
+* [x] Document read-only mounts
+* [x] Document OverlayFS persistence semantics
+* [x] Document host-backed mount persistence
+
+## Milestone 5 — Reliability & Hardening
+
+Make container setup and teardown robust against failures and hostile conditions.
+
+### Capability and privilege reduction
+
+* [x] Drop Linux capabilities
+* [x] Drop capability bounding set
+* [x] Set `no_new_privs`
+* [x] Establish parent-death handling
+* [x] Verify parent liveness across the `clone`/`prctl` race
+* [x] Close inherited descriptors before `execve`
+
+### Filesystem and runtime hardening
+
+* [ ] Restrict remaining filesystem/device access further
+* [ ] Review namespace-specific privilege boundaries
+* [ ] Audit inherited process state
+* [ ] Audit signal-handling edge cases
+* [ ] Audit mount propagation behaviour
+* [ ] Verify no host mounts are unintentionally exposed
+* [ ] Verify configured read-only mounts cannot be written from the container
+
+### Failure handling
+
+* [ ] Handle missing OverlayFS support
+* [ ] Handle unusable rootfs permissions
+* [ ] Handle failure during mount setup
+* [ ] Handle failure during `pivot_root`
+* [ ] Handle failure during `/dev` setup
+* [ ] Handle failure during `/proc` setup
+* [ ] Handle failure during configured mount setup
+* [ ] Verify cleanup after every setup failure
+* [ ] Verify no runtime-directory leaks
+* [ ] Verify no mount leaks
+* [ ] Verify no child-process leaks
+
+### Regression tests
+
+* [ ] Add hardening regression tests where appropriate
+* [ ] Add failure-path regression tests
+* [ ] Add teardown regression tests
+* [ ] Verify repeated container creation and teardown
+* [ ] Verify abnormal child termination is cleaned up correctly
+
+## Milestone 6 — Review & Release
+
+Bring the implementation and documentation into a coherent first release.
+
+### Implementation review
+
+* [ ] Complete implementation review
+* [ ] Remove unnecessary complexity
+* [ ] Simplify duplicated logic
+* [ ] Review resource ownership
+* [ ] Review error propagation
+* [ ] Review cleanup paths
+* [ ] Review public headers
+* [ ] Review compiler warnings
+* [ ] Review static-analysis findings
+
+### Testing
+
+* [ ] Run the complete clean test suite
+* [ ] Run tests from a clean build
+* [ ] Verify tests do not depend on the developer's environment
+* [ ] Verify temporary files and mounts are cleaned up
+* [ ] Verify configured mounts behave as documented
+* [ ] Verify supplied rootfs remains unchanged
+* [ ] Verify ordinary container changes are ephemeral
+
+### Documentation
+
+* [x] Keep README current with configuration usage
+* [x] Document rootfs requirements
+* [x] Document OverlayFS behaviour
+* [x] Document configured mount behaviour
+* [x] Document container lifecycle
+* [x] Document security model and limitations
+* [x] Document project structure
+* [x] Document build and test commands
+* [ ] Review documentation against final implementation
+
+### Release
+
+* [ ] Finalise commit history
+* [ ] Prepare final pull request
+* [ ] Review and merge Milestone 6
+* [ ] Create first release tag
+* [ ] Publish first release
