@@ -25,11 +25,11 @@ $(TARGET): $(OBJECTS)
 $(TEST_PROBE): tests/container_probe.c
 	$(CC) $(CFLAGS) $< -static -o $@
 
-$(TEST_RUNNER): tests/test_runner.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+$(TEST_RUNNER): tests/test_runner.c tests/utils.c tests/utils.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_runner.c tests/utils.c -o $@
 
-$(TEST_CONFIG): tests/test_config.c src/config.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_config.c src/config.c -o $@
+$(TEST_CONFIG): tests/test_config.c src/config.c tests/utils.c tests/utils.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_config.c src/config.c tests/utils.c -o $@
 
 test-config: $(TEST_CONFIG)
 	./$(TEST_CONFIG)

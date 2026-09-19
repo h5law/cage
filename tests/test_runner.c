@@ -1,4 +1,5 @@
-#include <errno.h>
+#include "utils.h"
+
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
@@ -6,10 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #define TEST_ROOTFS  "/tmp/cage-test-rootfs-XXXXXX"
@@ -19,258 +18,18 @@
 static const char *cage_path;
 static const char *probe_path;
 
-static int failures;
-
-static void pass(const char *name) { printf("PASS: %s\n", name); }
-
-static void fail(const char *name)
+static int make_config(char *path, size_t size)
 {
-    fprintf(stderr, "FAIL: %s\n", name);
-    failures++;
+    return make_temp_file("/tmp/cage-test-config-XXXXXX", path, size);
 }
 
-static int run_process(char *const argv[])
+static int prepare_rootfs_and_config(char *rootfs, size_t rootfs_size,
+                                     char *config, size_t config_size)
 {
-    pid_t pid = fork();
-
-    if (pid < 0)
+    if (make_config(config, config_size) < 0)
         return -1;
 
-    if (pid == 0) {
-        execv(argv[0], argv);
-        _exit(127);
-    }
-
-    int status;
-
-    do {
-        if (waitpid(pid, &status, 0) < 0)
-            return -1;
-    } while (!WIFEXITED(status) && !WIFSIGNALED(status));
-
-    if (WIFEXITED(status))
-        return WEXITSTATUS(status);
-
-    if (WIFSIGNALED(status))
-        return 128 + WTERMSIG(status);
-
-    return -1;
-}
-
-static pid_t start_cage(char *const argv[])
-{
-    pid_t pid = fork();
-
-    if (pid < 0)
-        return -1;
-
-    if (pid == 0) {
-        execv(cage_path, argv);
-        _exit(127);
-    }
-
-    return pid;
-}
-
-static int wait_process(pid_t pid)
-{
-    int status;
-
-    do {
-        if (waitpid(pid, &status, 0) < 0)
-            return -1;
-    } while (!WIFEXITED(status) && !WIFSIGNALED(status));
-
-    if (WIFEXITED(status))
-        return WEXITSTATUS(status);
-
-    if (WIFSIGNALED(status))
-        return 128 + WTERMSIG(status);
-
-    return -1;
-}
-
-static int make_temp_dir(const char *template, char *out, size_t size)
-{
-    if (strlen(template) + 1 > size)
-        return -1;
-
-    strcpy(out, template);
-
-    return mkdtemp(out) ? 0 : -1;
-}
-
-static int write_file(const char *path, const char *contents)
-{
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
-    if (fd < 0)
-        return -1;
-
-    size_t  len     = strlen(contents);
-    ssize_t written = write(fd, contents, len);
-
-    int saved_errno = errno;
-
-    close(fd);
-
-    if (written != ( ssize_t )len) {
-        errno = saved_errno;
-        return -1;
-    }
-
-    return 0;
-}
-
-static int file_exists(const char *path)
-{
-    struct stat st;
-
-    return stat(path, &st) == 0;
-}
-
-static int read_file(const char *path, char *buf, size_t size)
-{
-    int fd = open(path, O_RDONLY);
-
-    if (fd < 0)
-        return -1;
-
-    ssize_t n           = read(fd, buf, size - 1);
-    int     saved_errno = errno;
-
-    close(fd);
-
-    if (n < 0) {
-        errno = saved_errno;
-        return -1;
-    }
-
-    buf[n] = '\0';
-
-    return 0;
-}
-
-static int create_rootfs(char *rootfs, size_t size)
-{
-    if (make_temp_dir(TEST_ROOTFS, rootfs, size) < 0)
-        return -1;
-
-    char bin[PATH_MAX];
-
-    if (snprintf(bin, sizeof(bin), "%s/bin", rootfs) >= ( int )sizeof(bin))
-        return -1;
-
-    if (mkdir(bin, 0755) < 0)
-        return -1;
-
-    char probe[PATH_MAX];
-
-    if (snprintf(probe, sizeof(probe), "%s/bin/probe", rootfs) >=
-        ( int )sizeof(probe))
-        return -1;
-
-    int in = open(probe_path, O_RDONLY);
-
-    if (in < 0)
-        return -1;
-
-    int out = open(probe, O_WRONLY | O_CREAT | O_TRUNC, 0755);
-
-    if (out < 0) {
-        close(in);
-        return -1;
-    }
-
-    char    buf[8192];
-    ssize_t n;
-
-    while ((n = read(in, buf, sizeof(buf))) > 0) {
-        char   *p         = buf;
-        ssize_t remaining = n;
-
-        while (remaining > 0) {
-            ssize_t written = write(out, p, remaining);
-
-            if (written < 0) {
-                close(in);
-                close(out);
-                return -1;
-            }
-
-            p         += written;
-            remaining -= written;
-        }
-    }
-
-    int saved_errno = errno;
-
-    close(in);
-    close(out);
-
-    if (n < 0) {
-        errno = saved_errno;
-        return -1;
-    }
-
-    return 0;
-}
-
-static int remove_tree(const char *path)
-{
-    char command[PATH_MAX + 32];
-
-    if (snprintf(command, sizeof(command), "rm -rf -- '%s'", path) >=
-        ( int )sizeof(command))
-        return -1;
-
-    return system(command);
-}
-
-static int create_config(const char *path, const char *rootfs,
-                         const char *extra)
-{
-    FILE *fp = fopen(path, "w");
-
-    if (!fp)
-        return -1;
-
-    if (fprintf(fp, "rootfs = \"%s\"\n", rootfs) < 0) {
-        fclose(fp);
-        return -1;
-    }
-
-    if (extra && fputs(extra, fp) == EOF) {
-        fclose(fp);
-        return -1;
-    }
-
-    return fclose(fp);
-}
-
-static int test_exit_status(void)
-{
-    char *argv[] = {
-            ( char * )cage_path,
-            ( char * )"--config",
-            NULL,
-            ( char * )"/bin/probe",
-            ( char * )"exit",
-            ( char * )"42",
-            NULL,
-    };
-
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
-
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
-    char rootfs[PATH_MAX];
-
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0) {
+    if (create_rootfs(probe_path, TEST_ROOTFS, rootfs, rootfs_size) < 0) {
         unlink(config);
         return -1;
     }
@@ -281,37 +40,62 @@ static int test_exit_status(void)
         return -1;
     }
 
-    argv[2]    = config;
+    return 0;
+}
+
+static int test_exit_status(void)
+{
+    test_begin("command exit status is propagated");
+
+    char config[PATH_MAX];
+    char rootfs[PATH_MAX];
+
+    if (prepare_rootfs_and_config(rootfs, sizeof(rootfs), config,
+                                  sizeof(config)) < 0) {
+        test_fail("failed to prepare test rootfs");
+        return -1;
+    }
+
+    char *argv[] = {
+            ( char * )cage_path,
+            ( char * )"--config",
+            config,
+            ( char * )"/bin/probe",
+            ( char * )"exit",
+            ( char * )"42",
+            NULL,
+    };
 
     int status = run_process(argv);
 
     unlink(config);
     remove_tree(rootfs);
 
-    if (status != 42)
+    if (status != 42) {
+        test_fail("cage did not propagate the command exit status");
         return -1;
+    }
 
-    pass("command exit status is propagated");
+    test_pass();
     return 0;
 }
 
 static int test_signal(int sig, const char *name)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin(name);
 
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
+    char config[PATH_MAX];
     char rootfs[PATH_MAX];
 
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
-        goto error_config;
+    if (prepare_rootfs_and_config(rootfs, sizeof(rootfs), config,
+                                  sizeof(config)) < 0) {
+        test_fail("failed to prepare test rootfs");
+        return -1;
+    }
 
-    if (create_config(config, rootfs, NULL) < 0)
-        goto error_rootfs;
+    char signal_string[16];
+
+    snprintf(signal_string, sizeof(signal_string), "%d", sig);
 
     char *argv[] = {
             ( char * )cage_path,
@@ -319,21 +103,29 @@ static int test_signal(int sig, const char *name)
             config,
             ( char * )"/bin/probe",
             ( char * )"wait-signal",
-            "15",
+            signal_string,
             NULL,
     };
 
-    pid_t pid = start_cage(argv);
+    pid_t pid = start_process(cage_path, argv);
 
-    if (pid < 0)
-        goto error_rootfs;
+    if (pid < 0) {
+        test_fail("failed to start cage");
+        unlink(config);
+        remove_tree(rootfs);
+        return -1;
+    }
 
     usleep(100000);
 
     if (kill(pid, sig) < 0) {
         kill(pid, SIGKILL);
         wait_process(pid);
-        goto error_rootfs;
+
+        test_fail("failed to signal cage");
+        unlink(config);
+        remove_tree(rootfs);
+        return -1;
     }
 
     int status = wait_process(pid);
@@ -341,46 +133,46 @@ static int test_signal(int sig, const char *name)
     unlink(config);
     remove_tree(rootfs);
 
-    if (status != 128 + sig)
+    if (status != 128 + sig) {
+        test_fail("cage did not propagate the signal status");
         return -1;
+    }
 
-    pass(name);
+    test_pass();
     return 0;
-
-error_rootfs:
-    remove_tree(rootfs);
-error_config:
-    unlink(config);
-    return -1;
 }
 
-static int test_namespace(const char *probe, const char *name)
+static int test_namespace(const char *namespace_name, const char *name)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin(name);
 
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
+    char config[PATH_MAX];
     char rootfs[PATH_MAX];
 
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
-        goto error_config;
+    if (prepare_rootfs_and_config(rootfs, sizeof(rootfs), config,
+                                  sizeof(config)) < 0) {
+        test_fail("failed to prepare test rootfs");
+        return -1;
+    }
 
-    if (create_config(config, rootfs, NULL) < 0)
-        goto error_rootfs;
+    char path[PATH_MAX];
+
+    if (snprintf(path, sizeof(path), "/proc/self/ns/%s", namespace_name) >=
+        ( int )sizeof(path)) {
+        test_fail("namespace path is too long");
+        unlink(config);
+        remove_tree(rootfs);
+        return -1;
+    }
 
     struct stat st;
-    char        path[PATH_MAX];
 
-    if (snprintf(path, sizeof(path), "/proc/self/ns/%s", probe) >=
-        ( int )sizeof(path))
-        goto error_rootfs;
-
-    if (stat(path, &st) < 0)
-        goto error_rootfs;
+    if (stat(path, &st) < 0) {
+        test_fail("failed to stat host namespace");
+        unlink(config);
+        remove_tree(rootfs);
+        return -1;
+    }
 
     char dev[32];
     char ino[32];
@@ -394,7 +186,7 @@ static int test_namespace(const char *probe, const char *name)
             config,
             ( char * )"/bin/probe",
             ( char * )"namespace",
-            ( char * )probe,
+            ( char * )namespace_name,
             dev,
             ino,
             NULL,
@@ -405,38 +197,30 @@ static int test_namespace(const char *probe, const char *name)
     unlink(config);
     remove_tree(rootfs);
 
-    if (status != 0)
+    if (status != 0) {
+        test_fail("namespace was not isolated");
         return -1;
+    }
 
-    pass(name);
+    test_pass();
     return 0;
-
-error_rootfs:
-    remove_tree(rootfs);
-error_config:
-    unlink(config);
-    return -1;
 }
 
 static int test_uid_mapping(void)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin("user namespace identity mapping");
 
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
+    char config[PATH_MAX];
     char rootfs[PATH_MAX];
+
+    if (prepare_rootfs_and_config(rootfs, sizeof(rootfs), config,
+                                  sizeof(config)) < 0) {
+        test_fail("failed to prepare test rootfs");
+        return -1;
+    }
+
     char uid_string[32];
     char gid_string[32];
-
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
-        goto error_config;
-
-    if (create_config(config, rootfs, NULL) < 0)
-        goto error_rootfs;
 
     snprintf(uid_string, sizeof(uid_string), "%lu", ( unsigned long )getuid());
     snprintf(gid_string, sizeof(gid_string), "%lu", ( unsigned long )getgid());
@@ -457,36 +241,27 @@ static int test_uid_mapping(void)
     unlink(config);
     remove_tree(rootfs);
 
-    if (status != 0)
+    if (status != 0) {
+        test_fail("user namespace identity mapping failed");
         return -1;
+    }
 
-    pass("user namespace identity mapping");
+    test_pass();
     return 0;
-
-error_rootfs:
-    remove_tree(rootfs);
-error_config:
-    unlink(config);
-    return -1;
 }
 
 static int test_tmpfs(void)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin("/tmp is a private writable tmpfs");
 
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
+    char config[PATH_MAX];
     char rootfs[PATH_MAX];
 
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
-        goto error_config;
-
-    if (create_config(config, rootfs, NULL) < 0)
-        goto error_rootfs;
+    if (prepare_rootfs_and_config(rootfs, sizeof(rootfs), config,
+                                  sizeof(config)) < 0) {
+        test_fail("failed to prepare test rootfs");
+        return -1;
+    }
 
     char *argv[] = {
             ( char * )cage_path,
@@ -503,36 +278,27 @@ static int test_tmpfs(void)
     unlink(config);
     remove_tree(rootfs);
 
-    if (status != 0)
+    if (status != 0) {
+        test_fail("/tmp tmpfs probe failed");
         return -1;
+    }
 
-    pass("/tmp is a private writable tmpfs");
+    test_pass();
     return 0;
-
-error_rootfs:
-    remove_tree(rootfs);
-error_config:
-    unlink(config);
-    return -1;
 }
 
 static int test_proc(void)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin("/proc is a proc filesystem");
 
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
+    char config[PATH_MAX];
     char rootfs[PATH_MAX];
 
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
-        goto error_config;
-
-    if (create_config(config, rootfs, NULL) < 0)
-        goto error_rootfs;
+    if (prepare_rootfs_and_config(rootfs, sizeof(rootfs), config,
+                                  sizeof(config)) < 0) {
+        test_fail("failed to prepare test rootfs");
+        return -1;
+    }
 
     char *argv[] = {
             ( char * )cage_path,
@@ -549,36 +315,27 @@ static int test_proc(void)
     unlink(config);
     remove_tree(rootfs);
 
-    if (status != 0)
+    if (status != 0) {
+        test_fail("/proc probe failed");
         return -1;
+    }
 
-    pass("/proc is a proc filesystem");
+    test_pass();
     return 0;
-
-error_rootfs:
-    remove_tree(rootfs);
-error_config:
-    unlink(config);
-    return -1;
 }
 
 static int test_dev(void)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin("/dev is a private tmpfs with device nodes");
 
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
+    char config[PATH_MAX];
     char rootfs[PATH_MAX];
 
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
-        goto error_config;
-
-    if (create_config(config, rootfs, NULL) < 0)
-        goto error_rootfs;
+    if (prepare_rootfs_and_config(rootfs, sizeof(rootfs), config,
+                                  sizeof(config)) < 0) {
+        test_fail("failed to prepare test rootfs");
+        return -1;
+    }
 
     char *argv[] = {
             ( char * )cage_path,
@@ -596,37 +353,26 @@ static int test_dev(void)
     remove_tree(rootfs);
 
     if (status != 0) {
-        fprintf(stderr, "dev probe exited with status %d\n", status);
+        test_fail("/dev probe failed");
         return -1;
     }
 
-    pass("/dev is a private tmpfs with device nodes");
+    test_pass();
     return 0;
-
-error_rootfs:
-    remove_tree(rootfs);
-error_config:
-    unlink(config);
-    return -1;
 }
 
 static int test_capabilities(void)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin("capabilities are dropped");
 
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
+    char config[PATH_MAX];
     char rootfs[PATH_MAX];
 
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
-        goto error_config;
-
-    if (create_config(config, rootfs, NULL) < 0)
-        goto error_rootfs;
+    if (prepare_rootfs_and_config(rootfs, sizeof(rootfs), config,
+                                  sizeof(config)) < 0) {
+        test_fail("failed to prepare test rootfs");
+        return -1;
+    }
 
     char *argv[] = {
             ( char * )cage_path,    ( char * )"--config",     config,
@@ -638,36 +384,27 @@ static int test_capabilities(void)
     unlink(config);
     remove_tree(rootfs);
 
-    if (status != 0)
+    if (status != 0) {
+        test_fail("capability probe failed");
         return -1;
+    }
 
-    pass("capabilities are dropped");
+    test_pass();
     return 0;
-
-error_rootfs:
-    remove_tree(rootfs);
-error_config:
-    unlink(config);
-    return -1;
 }
 
 static int test_no_new_privs(void)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin("no_new_privs is enabled");
 
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
+    char config[PATH_MAX];
     char rootfs[PATH_MAX];
 
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
-        goto error_config;
-
-    if (create_config(config, rootfs, NULL) < 0)
-        goto error_rootfs;
+    if (prepare_rootfs_and_config(rootfs, sizeof(rootfs), config,
+                                  sizeof(config)) < 0) {
+        test_fail("failed to prepare test rootfs");
+        return -1;
+    }
 
     char *argv[] = {
             ( char * )cage_path,    ( char * )"--config",     config,
@@ -679,36 +416,27 @@ static int test_no_new_privs(void)
     unlink(config);
     remove_tree(rootfs);
 
-    if (status != 0)
+    if (status != 0) {
+        test_fail("no_new_privs probe failed");
         return -1;
+    }
 
-    pass("no_new_privs is enabled");
+    test_pass();
     return 0;
-
-error_rootfs:
-    remove_tree(rootfs);
-error_config:
-    unlink(config);
-    return -1;
 }
 
 static int test_fd_inheritance(void)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin("internal file descriptors are not inherited");
 
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
+    char config[PATH_MAX];
     char rootfs[PATH_MAX];
 
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
-        goto error_config;
-
-    if (create_config(config, rootfs, NULL) < 0)
-        goto error_rootfs;
+    if (prepare_rootfs_and_config(rootfs, sizeof(rootfs), config,
+                                  sizeof(config)) < 0) {
+        test_fail("failed to prepare test rootfs");
+        return -1;
+    }
 
     char *argv[] = {
             ( char * )cage_path,    ( char * )"--config",       config,
@@ -720,36 +448,27 @@ static int test_fd_inheritance(void)
     unlink(config);
     remove_tree(rootfs);
 
-    if (status != 0)
+    if (status != 0) {
+        test_fail("file descriptor inheritance probe failed");
         return -1;
+    }
 
-    pass("internal file descriptors are not inherited");
+    test_pass();
     return 0;
-
-error_rootfs:
-    remove_tree(rootfs);
-error_config:
-    unlink(config);
-    return -1;
 }
 
 static int test_exec_failure(void)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin("exec failure is propagated");
 
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
+    char config[PATH_MAX];
     char rootfs[PATH_MAX];
 
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
-        goto error_config;
-
-    if (create_config(config, rootfs, NULL) < 0)
-        goto error_rootfs;
+    if (prepare_rootfs_and_config(rootfs, sizeof(rootfs), config,
+                                  sizeof(config)) < 0) {
+        test_fail("failed to prepare test rootfs");
+        return -1;
+    }
 
     char *argv[] = {
             ( char * )cage_path,
@@ -764,32 +483,30 @@ static int test_exec_failure(void)
     unlink(config);
     remove_tree(rootfs);
 
-    if (status != 127)
+    if (status != 127) {
+        test_fail("exec failure did not return status 127");
         return -1;
+    }
 
-    pass("exec failure is propagated");
+    test_pass();
     return 0;
-
-error_rootfs:
-    remove_tree(rootfs);
-error_config:
-    unlink(config);
-    return -1;
 }
 
 static int test_invalid_rootfs(void)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin("invalid rootfs is rejected");
 
-    if (fd < 0)
+    char config[PATH_MAX];
+
+    if (make_config(config, sizeof(config)) < 0) {
+        test_fail("failed to create configuration");
         return -1;
-
-    close(fd);
+    }
 
     if (create_config(config, "/tmp/cage-rootfs-that-does-not-exist", NULL) <
         0) {
         unlink(config);
+        test_fail("failed to create configuration");
         return -1;
     }
 
@@ -799,7 +516,7 @@ static int test_invalid_rootfs(void)
             config,
             ( char * )"/bin/probe",
             ( char * )"exit",
-            "0",
+            ( char * )"0",
             NULL,
     };
 
@@ -807,46 +524,50 @@ static int test_invalid_rootfs(void)
 
     unlink(config);
 
-    if (status == 0)
+    if (status == 0) {
+        test_fail("invalid rootfs was accepted");
         return -1;
+    }
 
-    pass("invalid rootfs is rejected");
+    test_pass();
     return 0;
 }
 
 static int test_parent_death(void)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin("container dies when cage supervisor dies");
 
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
+    char config[PATH_MAX];
     char rootfs[PATH_MAX];
 
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
-        goto error_config;
-
-    if (create_config(config, rootfs, NULL) < 0)
-        goto error_rootfs;
+    if (prepare_rootfs_and_config(rootfs, sizeof(rootfs), config,
+                                  sizeof(config)) < 0) {
+        test_fail("failed to prepare test rootfs");
+        return -1;
+    }
 
     char *argv[] = {
             ( char * )cage_path,    ( char * )"--config", config,
             ( char * )"/bin/probe", ( char * )"hold",     NULL,
     };
 
-    pid_t pid = start_cage(argv);
+    pid_t pid = start_process(cage_path, argv);
 
-    if (pid < 0)
-        goto error_rootfs;
+    if (pid < 0) {
+        test_fail("failed to start cage");
+        unlink(config);
+        remove_tree(rootfs);
+        return -1;
+    }
 
     usleep(200000);
 
     if (kill(pid, SIGKILL) < 0) {
         wait_process(pid);
-        goto error_rootfs;
+        test_fail("failed to kill cage supervisor");
+        unlink(config);
+        remove_tree(rootfs);
+        return -1;
     }
 
     wait_process(pid);
@@ -856,48 +577,65 @@ static int test_parent_death(void)
     unlink(config);
     remove_tree(rootfs);
 
-    pass("container dies when cage supervisor dies");
+    /*
+     * The probe is responsible for detecting that the supervisor died.
+     * If cage survived the SIGKILL long enough to leave the child running,
+     * the probe would retain the resources we subsequently tear down.
+     */
+    test_pass();
     return 0;
-
-error_rootfs:
-    remove_tree(rootfs);
-error_config:
-    unlink(config);
-    return -1;
 }
 
 static int test_configured_writable_mount(void)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin("configured writable mount persists");
 
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
+    char config[PATH_MAX];
     char rootfs[PATH_MAX];
     char mount_dir[PATH_MAX];
 
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
-        goto error_config;
+    if (make_config(config, sizeof(config)) < 0) {
+        test_fail("failed to create configuration");
+        return -1;
+    }
 
-    if (make_temp_dir(TEST_MOUNT, mount_dir, sizeof(mount_dir)) < 0)
-        goto error_rootfs;
+    if (create_rootfs(probe_path, TEST_ROOTFS, rootfs, sizeof(rootfs)) < 0) {
+        unlink(config);
+        test_fail("failed to create rootfs");
+        return -1;
+    }
 
-    if (create_config(config, rootfs,
-                      "\n[[mounts]]\n"
-                      "source = \"") < 0)
-        goto error_mount;
+    if (make_temp_dir(TEST_MOUNT, mount_dir, sizeof(mount_dir)) < 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        test_fail("failed to create mount source");
+        return -1;
+    }
 
-    FILE *fp = fopen(config, "a");
+    FILE *fp = fopen(config, "w");
 
-    if (!fp)
-        goto error_mount;
+    if (fp == NULL) {
+        remove_tree(mount_dir);
+        remove_tree(rootfs);
+        unlink(config);
+        test_fail("failed to write configuration");
+        return -1;
+    }
 
-    fprintf(fp, "%s\"\n", mount_dir);
-    fprintf(fp, "target = \"/data\"\n");
-    fclose(fp);
+    if (fprintf(fp,
+                "rootfs = \"%s\"\n\n"
+                "[[mounts]]\n"
+                "source = \"%s\"\n"
+                "target = \"/data\"\n",
+                rootfs, mount_dir) < 0 ||
+        fclose(fp) != 0) {
+        fclose(fp);
+        remove_tree(mount_dir);
+        remove_tree(rootfs);
+        unlink(config);
+        test_fail("failed to write configuration");
+        return -1;
+    }
 
     char *argv[] = {
             ( char * )cage_path,
@@ -912,83 +650,108 @@ static int test_configured_writable_mount(void)
 
     int status = run_process(argv);
 
-    if (status != 0)
-        goto error_mount;
+    if (status != 0) {
+        remove_tree(mount_dir);
+        remove_tree(rootfs);
+        unlink(config);
+        test_fail("cage failed to write through configured mount");
+        return -1;
+    }
 
     char persistent[PATH_MAX];
 
     if (snprintf(persistent, sizeof(persistent), "%s/persistent", mount_dir) >=
-        ( int )sizeof(persistent))
-        goto error_mount;
-
-    if (!file_exists(persistent))
-        goto error_mount;
+        ( int )sizeof(persistent)) {
+        remove_tree(mount_dir);
+        remove_tree(rootfs);
+        unlink(config);
+        test_fail("persistent file path is too long");
+        return -1;
+    }
 
     char contents[128];
 
-    if (read_file(persistent, contents, sizeof(contents)) < 0)
-        goto error_mount;
-
-    if (strcmp(contents, "persistent-data") != 0)
-        goto error_mount;
+    if (!file_exists(persistent) ||
+        read_file(persistent, contents, sizeof(contents)) < 0 ||
+        strcmp(contents, "persistent-data") != 0) {
+        remove_tree(mount_dir);
+        remove_tree(rootfs);
+        unlink(config);
+        test_fail("configured writable mount did not persist data");
+        return -1;
+    }
 
     unlink(config);
     remove_tree(rootfs);
     remove_tree(mount_dir);
 
-    pass("configured writable mount persists");
+    test_pass();
     return 0;
-
-error_mount:
-    remove_tree(mount_dir);
-error_rootfs:
-    remove_tree(rootfs);
-error_config:
-    unlink(config);
-    return -1;
 }
 
 static int test_configured_readonly_mount(void)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin("configured read-only mount rejects writes");
 
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
+    char config[PATH_MAX];
     char rootfs[PATH_MAX];
     char mount_dir[PATH_MAX];
 
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
-        goto error_config;
+    if (make_config(config, sizeof(config)) < 0) {
+        test_fail("failed to create configuration");
+        return -1;
+    }
 
-    if (make_temp_dir(TEST_MOUNT, mount_dir, sizeof(mount_dir)) < 0)
-        goto error_rootfs;
+    if (create_rootfs(probe_path, TEST_ROOTFS, rootfs, sizeof(rootfs)) < 0) {
+        unlink(config);
+        test_fail("failed to create rootfs");
+        return -1;
+    }
+
+    if (make_temp_dir(TEST_MOUNT, mount_dir, sizeof(mount_dir)) < 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        test_fail("failed to create mount source");
+        return -1;
+    }
 
     char source_file[PATH_MAX];
 
     if (snprintf(source_file, sizeof(source_file), "%s/original", mount_dir) >=
-        ( int )sizeof(source_file))
-        goto error_mount;
-
-    if (write_file(source_file, "original") < 0)
-        goto error_mount;
+                ( int )sizeof(source_file) ||
+        write_file(source_file, "original") < 0) {
+        remove_tree(mount_dir);
+        remove_tree(rootfs);
+        unlink(config);
+        test_fail("failed to create source file");
+        return -1;
+    }
 
     FILE *fp = fopen(config, "w");
 
-    if (!fp)
-        goto error_mount;
+    if (fp == NULL) {
+        remove_tree(mount_dir);
+        remove_tree(rootfs);
+        unlink(config);
+        test_fail("failed to write configuration");
+        return -1;
+    }
 
-    fprintf(fp, "rootfs = \"%s\"\n\n", rootfs);
-    fprintf(fp, "[[mounts]]\n");
-    fprintf(fp, "source = \"%s\"\n", mount_dir);
-    fprintf(fp, "target = \"/data\"\n");
-    fprintf(fp, "readonly = true\n");
-
-    if (fclose(fp) != 0)
-        goto error_mount;
+    if (fprintf(fp,
+                "rootfs = \"%s\"\n\n"
+                "[[mounts]]\n"
+                "source = \"%s\"\n"
+                "target = \"/data\"\n"
+                "readonly = true\n",
+                rootfs, mount_dir) < 0 ||
+        fclose(fp) != 0) {
+        fclose(fp);
+        remove_tree(mount_dir);
+        remove_tree(rootfs);
+        unlink(config);
+        test_fail("failed to write configuration");
+        return -1;
+    }
 
     char *argv[] = {
             ( char * )cage_path,
@@ -1003,66 +766,74 @@ static int test_configured_readonly_mount(void)
 
     int status = run_process(argv);
 
+    char contents[128];
+    int  unchanged = file_exists(source_file) &&
+                     read_file(source_file, contents, sizeof(contents)) == 0 &&
+                     strcmp(contents, "original") == 0;
+
     unlink(config);
     remove_tree(rootfs);
+    remove_tree(mount_dir);
 
-    if (file_exists(source_file)) {
-        char contents[128];
-
-        if (read_file(source_file, contents, sizeof(contents)) == 0 &&
-            strcmp(contents, "original") == 0) {
-            remove_tree(mount_dir);
-
-            if (status != 0) {
-                pass("configured read-only mount rejects writes");
-                return 0;
-            }
-        }
+    if (status == 0 || !unchanged) {
+        test_fail("read-only mount allowed the write");
+        return -1;
     }
 
-    remove_tree(mount_dir);
-    return -1;
-
-error_mount:
-    remove_tree(mount_dir);
-error_rootfs:
-    remove_tree(rootfs);
-error_config:
-    unlink(config);
-    return -1;
+    test_pass();
+    return 0;
 }
 
 static int test_configured_mount_failure_cleanup(void)
 {
-    char config[] = "/tmp/cage-test-config-XXXXXX";
-    int  fd       = mkstemp(config);
+    test_begin("configured mount failure cleans up");
 
-    if (fd < 0)
-        return -1;
-
-    close(fd);
-
+    char config[PATH_MAX];
     char rootfs[PATH_MAX];
     char runtime[PATH_MAX];
 
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
-        goto error_config;
+    if (make_config(config, sizeof(config)) < 0) {
+        test_fail("failed to create configuration");
+        return -1;
+    }
 
-    if (make_temp_dir(TEST_RUNTIME, runtime, sizeof(runtime)) < 0)
-        goto error_rootfs;
+    if (create_rootfs(probe_path, TEST_ROOTFS, rootfs, sizeof(rootfs)) < 0) {
+        unlink(config);
+        test_fail("failed to create rootfs");
+        return -1;
+    }
+
+    if (make_temp_dir(TEST_RUNTIME, runtime, sizeof(runtime)) < 0) {
+        unlink(config);
+        remove_tree(rootfs);
+        test_fail("failed to create runtime directory");
+        return -1;
+    }
 
     FILE *fp = fopen(config, "w");
 
-    if (!fp)
-        goto error_runtime;
+    if (fp == NULL) {
+        remove_tree(runtime);
+        remove_tree(rootfs);
+        unlink(config);
+        test_fail("failed to write configuration");
+        return -1;
+    }
 
-    fprintf(fp, "rootfs = \"%s\"\n\n", rootfs);
-    fprintf(fp, "[[mounts]]\n");
-    fprintf(fp, "source = \"%s/missing-mount-source\"\n", runtime);
-    fprintf(fp, "target = \"/data\"\n");
-
-    if (fclose(fp) != 0)
-        goto error_runtime;
+    if (fprintf(fp,
+                "rootfs = \"%s\"\n\n"
+                "[[mounts]]\n"
+                "source = \"%s/missing-mount-source\"\n"
+                "target = \"/data\"\n",
+                rootfs, runtime) < 0 ||
+        fclose(fp) != 0) {
+        fclose(fp);
+        remove_tree(runtime);
+        remove_tree(rootfs);
+        unlink(config);
+        test_fail("failed to write configuration");
+        return -1;
+    }
 
     char *argv[] = {
             ( char * )cage_path,
@@ -1070,7 +841,7 @@ static int test_configured_mount_failure_cleanup(void)
             config,
             ( char * )"/bin/probe",
             ( char * )"exit",
-            "0",
+            ( char * )"0",
             NULL,
     };
 
@@ -1081,50 +852,59 @@ static int test_configured_mount_failure_cleanup(void)
 
     if (status == 0) {
         remove_tree(runtime);
+        test_fail("invalid mount was accepted");
         return -1;
     }
 
-    remove_tree(runtime);
+    /*
+     * The runtime directory is deliberately removed only after cage has
+     * exited. If cage leaked a mount of the runtime tree, removal would
+     * fail or leave contents behind.
+     */
+    int cleanup_status = remove_tree(runtime);
 
-    pass("configured mount failure cleans up");
+    if (cleanup_status != 0) {
+        test_fail("mount failure did not clean up");
+        return -1;
+    }
+
+    test_pass();
     return 0;
-
-error_runtime:
-    remove_tree(runtime);
-error_rootfs:
-    remove_tree(rootfs);
-error_config:
-    unlink(config);
-    return -1;
 }
 
 static int test_default_config(void)
 {
+    test_begin("default configuration is loaded");
+
     char cwd[PATH_MAX];
     char rootfs[PATH_MAX];
     char config[PATH_MAX];
+    char backup[PATH_MAX];
 
-    if (getcwd(cwd, sizeof(cwd)) == NULL)
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        test_fail("failed to determine current directory");
         return -1;
+    }
 
-    if (create_rootfs(rootfs, sizeof(rootfs)) < 0)
+    if (create_rootfs(probe_path, TEST_ROOTFS, rootfs, sizeof(rootfs)) < 0) {
+        test_fail("failed to create rootfs");
         return -1;
+    }
 
     if (snprintf(config, sizeof(config), "%s/cage.toml", cwd) >=
         ( int )sizeof(config)) {
         remove_tree(rootfs);
+        test_fail("configuration path is too long");
         return -1;
     }
 
     bool had_config = file_exists(config);
 
-    char backup[PATH_MAX];
-    backup[0] = '\0';
-
     if (had_config) {
         if (snprintf(backup, sizeof(backup), "%s/cage.toml.cage-test-backup",
                      cwd) >= ( int )sizeof(backup)) {
             remove_tree(rootfs);
+            test_fail("backup path is too long");
             return -1;
         }
 
@@ -1132,6 +912,7 @@ static int test_default_config(void)
 
         if (rename(config, backup) < 0) {
             remove_tree(rootfs);
+            test_fail("failed to back up existing cage.toml");
             return -1;
         }
     }
@@ -1156,10 +937,12 @@ static int test_default_config(void)
 
     remove_tree(rootfs);
 
-    if (status != 23)
+    if (status != 23) {
+        test_fail("default cage.toml was not loaded");
         return -1;
+    }
 
-    pass("default configuration is loaded");
+    test_pass();
     return 0;
 
 error:
@@ -1169,11 +952,15 @@ error:
         rename(backup, config);
 
     remove_tree(rootfs);
+
+    test_fail("failed to create default configuration");
     return -1;
 }
 
 static int test_missing_config_argument(void)
 {
+    test_begin("missing --config argument is rejected");
+
     char *argv[] = {
             ( char * )cage_path,
             ( char * )"--config",
@@ -1182,15 +969,19 @@ static int test_missing_config_argument(void)
 
     int status = run_process(argv);
 
-    if (status == 0)
+    if (status == 0) {
+        test_fail("missing --config argument was accepted");
         return -1;
+    }
 
-    pass("missing --config argument is rejected");
+    test_pass();
     return 0;
 }
 
 static int test_duplicate_config_argument(void)
 {
+    test_begin("duplicate --config is rejected");
+
     char *argv[] = {
             ( char * )cage_path,
             ( char * )"--config",
@@ -1205,10 +996,12 @@ static int test_duplicate_config_argument(void)
 
     int status = run_process(argv);
 
-    if (status == 0)
+    if (status == 0) {
+        test_fail("duplicate --config argument was accepted");
         return -1;
+    }
 
-    pass("duplicate --config is rejected");
+    test_pass();
     return 0;
 }
 
@@ -1222,85 +1015,39 @@ int main(int argc, char **argv)
     cage_path  = argv[1];
     probe_path = argv[2];
 
-    if (test_exit_status() < 0)
-        failures++;
+    test_exit_status();
 
-    if (test_signal(SIGTERM, "SIGTERM") < 0)
-        failures++;
+    test_signal(SIGTERM, "SIGTERM");
+    test_signal(SIGINT, "SIGINT");
+    test_signal(SIGHUP, "SIGHUP");
+    test_signal(SIGQUIT, "SIGQUIT");
 
-    if (test_signal(SIGINT, "SIGINT") < 0)
-        failures++;
+    test_namespace("pid", "PID namespace isolates process IDs");
+    test_namespace("user", "user namespace isolates user identity");
+    test_uid_mapping();
+    test_namespace("mnt", "mount namespace isolates mounts");
 
-    if (test_signal(SIGHUP, "SIGHUP") < 0)
-        failures++;
+    test_tmpfs();
+    test_proc();
+    test_dev();
 
-    if (test_signal(SIGQUIT, "SIGQUIT") < 0)
-        failures++;
+    test_namespace("net", "network namespace isolates networking");
+    test_namespace("ipc", "IPC namespace isolates IPC objects");
 
-    if (test_namespace("pid", "PID namespace isolates process IDs") < 0)
-        failures++;
+    test_capabilities();
+    test_no_new_privs();
+    test_fd_inheritance();
+    test_exec_failure();
+    test_invalid_rootfs();
+    test_parent_death();
 
-    if (test_namespace("user", "user namespace isolates user identity") < 0)
-        failures++;
+    test_configured_writable_mount();
+    test_configured_readonly_mount();
+    test_configured_mount_failure_cleanup();
 
-    if (test_uid_mapping() < 0)
-        failures++;
+    test_default_config();
+    test_missing_config_argument();
+    test_duplicate_config_argument();
 
-    if (test_namespace("mnt", "mount namespace isolates mounts") < 0)
-        failures++;
-
-    if (test_tmpfs() < 0)
-        failures++;
-
-    if (test_proc() < 0)
-        failures++;
-
-    if (test_dev() < 0)
-        failures++;
-
-    if (test_namespace("net", "network namespace isolates networking") < 0)
-        failures++;
-
-    if (test_namespace("ipc", "IPC namespace isolates IPC objects") < 0)
-        failures++;
-
-    if (test_capabilities() < 0)
-        failures++;
-
-    if (test_no_new_privs() < 0)
-        failures++;
-
-    if (test_fd_inheritance() < 0)
-        failures++;
-
-    if (test_exec_failure() < 0)
-        failures++;
-
-    if (test_invalid_rootfs() < 0)
-        failures++;
-
-    if (test_parent_death() < 0)
-        failures++;
-
-    if (test_configured_writable_mount() < 0)
-        failures++;
-
-    if (test_configured_readonly_mount() < 0)
-        failures++;
-
-    if (test_configured_mount_failure_cleanup() < 0)
-        failures++;
-
-    if (test_default_config() < 0)
-        failures++;
-
-    if (test_missing_config_argument() < 0)
-        failures++;
-
-    if (test_duplicate_config_argument() < 0)
-        failures++;
-
-    printf("\n28 tests, %d failures\n", failures);
-
-    return failures ? 1 : 0;
+    return test_run();
 }
