@@ -7,6 +7,23 @@
 #include <stdlib.h>
 #include <string.h>
 
+static void strip_comment(char *line)
+{
+    int in_string = 0;
+
+    for (; *line != '\0'; ++line) {
+        if (*line == '"') {
+            in_string = !in_string;
+            continue;
+        }
+
+        if (*line == '#' && !in_string) {
+            *line = '\0';
+            return;
+        }
+    }
+}
+
 static char *trim(char *string)
 {
     char *end;
@@ -201,16 +218,8 @@ static int parse_line(struct cage_config   *config,
     if (*line == '\0' || *line == '#')
         return 0;
 
-    {
-        char *comment = strchr(line, '#');
-
-        if (comment != NULL) {
-            if (comment == line || comment[-1] != '\\') {
-                *comment = '\0';
-                line     = trim(line);
-            }
-        }
-    }
+    strip_comment(line);
+    line = trim(line);
 
     if (*line == '\0')
         return 0;

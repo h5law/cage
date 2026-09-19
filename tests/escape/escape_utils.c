@@ -378,21 +378,35 @@ int escape_create_rootfs(const char *probe_path, const char *template,
     char bin[PATH_MAX];
     char probe[PATH_MAX];
 
-    if (escape_make_temp_dir(template, rootfs, size) == -1)
+    if (escape_make_temp_dir(template, rootfs, size) == -1) {
+        perror("escape_create_rootfs: mkdtemp");
         return -1;
+    }
 
-    if (snprintf(bin, sizeof(bin), "%s/bin", rootfs) >= ( int )sizeof(bin))
+    if (snprintf(bin, sizeof(bin), "%s/bin", rootfs) < 0 ||
+        ( size_t )snprintf(bin, sizeof(bin), "%s/bin", rootfs) >= sizeof(bin)) {
+        errno = ENAMETOOLONG;
+        perror("escape_create_rootfs: bin path");
         goto error;
+    }
 
-    if (mkdir(bin, 0755) == -1)
+    if (mkdir(bin, 0755) == -1) {
+        perror("escape_create_rootfs: mkdir");
         goto error;
+    }
 
-    if (snprintf(probe, sizeof(probe), "%s/bin/escape-probe", rootfs) >=
-        ( int )sizeof(probe))
+    if (snprintf(probe, sizeof(probe), "%s/bin/escape-probe", rootfs) < 0 ||
+        ( size_t )snprintf(probe, sizeof(probe), "%s/bin/escape-probe",
+                           rootfs) >= sizeof(probe)) {
+        errno = ENAMETOOLONG;
+        perror("escape_create_rootfs: probe path");
         goto error;
+    }
 
-    if (copy_file(probe_path, probe) == -1)
+    if (copy_file(probe_path, probe) == -1) {
+        perror("escape_create_rootfs: copy_file");
         goto error;
+    }
 
     return 0;
 
