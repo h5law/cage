@@ -1,5 +1,6 @@
 #include "utils.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -134,8 +135,17 @@ int write_file(const char *path, const char *contents)
 
         if (written < 0) {
             int saved_errno = errno;
+
             close(fd);
             errno = saved_errno;
+
+            return -1;
+        }
+
+        if (written == 0) {
+            close(fd);
+            errno = EIO;
+
             return -1;
         }
 
@@ -193,6 +203,52 @@ int remove_tree(const char *path)
     return system(command);
 }
 
+int count_dirs_with_prefix(const char *directory, const char *prefix)
+{
+    DIR           *dir;
+    struct dirent *entry;
+    int            count = 0;
+
+    dir                  = opendir(directory);
+
+    if (dir == NULL)
+        return -1;
+
+    while ((entry = readdir(dir)) != NULL) {
+        struct stat status;
+
+        if (strncmp(entry->d_name, prefix, strlen(prefix)) != 0)
+            continue;
+
+        char path[PATH_MAX];
+
+        if (snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name) >=
+            ( int )sizeof(path)) {
+            closedir(dir);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+
+        if (stat(path, &status) == -1) {
+            if (errno == ENOENT)
+                continue;
+
+            closedir(dir);
+            return -1;
+        }
+
+        if (!S_ISDIR(status.st_mode))
+            continue;
+
+        ++count;
+    }
+
+    if (closedir(dir) == -1)
+        return -1;
+
+    return count;
+}
+
 int create_rootfs(const char *probe_path, const char *template, char *rootfs,
                   size_t size)
 {
@@ -236,9 +292,19 @@ int create_rootfs(const char *probe_path, const char *template, char *rootfs,
 
             if (written < 0) {
                 int saved_errno = errno;
+
                 close(in);
                 close(out);
                 errno = saved_errno;
+
+                goto error;
+            }
+
+            if (written == 0) {
+                close(in);
+                close(out);
+                errno = EIO;
+
                 goto error;
             }
 

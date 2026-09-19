@@ -22,6 +22,7 @@ int write_file(const char *path, const char *contents);
 int read_file(const char *path, char *buf, size_t size);
 int file_exists(const char *path);
 int remove_tree(const char *path);
+int count_dirs_with_prefix(const char *directory, const char *prefix);
 
 int create_rootfs(const char *probe_path, const char *template, char *rootfs,
                   size_t size);

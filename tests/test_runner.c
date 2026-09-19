@@ -11,9 +11,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define TEST_ROOTFS  "/tmp/cage-test-rootfs-XXXXXX"
-#define TEST_RUNTIME "/tmp/cage-test-runtime-XXXXXX"
-#define TEST_MOUNT   "/tmp/cage-test-mount-XXXXXX"
+#define TEST_ROOTFS       "/tmp/cage-test-rootfs-XXXXXX"
+#define TEST_RUNTIME_DIR  "/tmp"
+#define TEST_RUNTIME_PREF "cage-"
+#define TEST_MOUNT        "/tmp/cage-test-mount-XXXXXX"
 
 static const char *cage_path;
 static const char *probe_path;
@@ -21,6 +22,21 @@ static const char *probe_path;
 static int make_config(char *path, size_t size)
 {
     return make_temp_file("/tmp/cage-test-config-XXXXXX", path, size);
+}
+
+static int runtime_dir_count(void)
+{
+    return count_dirs_with_prefix(TEST_RUNTIME_DIR, TEST_RUNTIME_PREF);
+}
+
+static int runtime_dirs_unchanged(int before)
+{
+    int after = runtime_dir_count();
+
+    if (after < 0)
+        return -1;
+
+    return after == before ? 0 : 1;
 }
 
 static int prepare_rootfs_and_config(char *rootfs, size_t rootfs_size,
@@ -84,6 +100,13 @@ static int test_signal(int sig, const char *name)
 {
     test_begin(name);
 
+    int runtime_before = runtime_dir_count();
+
+    if (runtime_before < 0) {
+        test_fail("failed to inspect runtime directory");
+        return -1;
+    }
+
     char config[PATH_MAX];
     char rootfs[PATH_MAX];
 
@@ -135,6 +158,11 @@ static int test_signal(int sig, const char *name)
 
     if (status != 128 + sig) {
         test_fail("cage did not propagate the signal status");
+        return -1;
+    }
+
+    if (runtime_dirs_unchanged(runtime_before) != 0) {
+        test_fail("runtime directory leaked after signal teardown");
         return -1;
     }
 
@@ -291,6 +319,13 @@ static int test_tmpfs_setup_failure_cleanup(void)
 {
     test_begin("tmpfs setup failure cleans up");
 
+    int runtime_before = runtime_dir_count();
+
+    if (runtime_before < 0) {
+        test_fail("failed to inspect runtime directory");
+        return -1;
+    }
+
     char config[PATH_MAX];
     char rootfs[PATH_MAX];
     char tmp_path[PATH_MAX];
@@ -344,6 +379,11 @@ static int test_tmpfs_setup_failure_cleanup(void)
 
     if (remove_tree(rootfs) != 0) {
         test_fail("rootfs could not be cleaned after tmpfs failure");
+        return -1;
+    }
+
+    if (runtime_dirs_unchanged(runtime_before) != 0) {
+        test_fail("runtime directory leaked after tmpfs setup failure");
         return -1;
     }
 
@@ -641,11 +681,6 @@ static int test_parent_death(void)
     unlink(config);
     remove_tree(rootfs);
 
-    /*
-     * The probe is responsible for detecting that the supervisor died.
-     * If cage survived the SIGKILL long enough to leave the child running,
-     * the probe would retain the resources we subsequently tear down.
-     */
     test_pass();
     return 0;
 }
@@ -653,6 +688,13 @@ static int test_parent_death(void)
 static int test_repeated_container_lifecycle(void)
 {
     test_begin("repeated container creation and teardown");
+
+    int runtime_before = runtime_dir_count();
+
+    if (runtime_before < 0) {
+        test_fail("failed to inspect runtime directory");
+        return -1;
+    }
 
     for (int i = 0; i < 10; ++i) {
         char config[PATH_MAX];
@@ -699,6 +741,11 @@ static int test_repeated_container_lifecycle(void)
 
         if (remove_tree(rootfs) != 0) {
             test_fail("rootfs cleanup failed after repetition");
+            return -1;
+        }
+
+        if (runtime_dirs_unchanged(runtime_before) != 0) {
+            test_fail("runtime directory leaked during repeated lifecycle");
             return -1;
         }
     }
@@ -752,9 +799,6 @@ static int test_configured_writable_mount(void)
         return -1;
     }
 
-    /*
-     * Append the configured writable bind mount.
-     */
     FILE *fp = fopen(config, "a");
 
     if (fp == NULL) {
@@ -1006,11 +1050,6 @@ static int test_configured_mount_survives_teardown(void)
 
     int status = run_process(argv);
 
-    /*
-     * Cage must have completely exited before the host-backed source
-     * is inspected. This verifies that the data is not part of the
-     * ephemeral OverlayFS layer.
-     */
     if (status != 0) {
         unlink(config);
         remove_tree(rootfs);
@@ -1042,6 +1081,13 @@ static int test_configured_mount_survives_teardown(void)
 static int test_configured_mount_failure_cleanup(void)
 {
     test_begin("configured mount failure cleans up");
+
+    int runtime_before = runtime_dir_count();
+
+    if (runtime_before < 0) {
+        test_fail("failed to inspect runtime directory");
+        return -1;
+    }
 
     char config[PATH_MAX];
     char rootfs[PATH_MAX];
@@ -1075,11 +1121,6 @@ static int test_configured_mount_failure_cleanup(void)
         return -1;
     }
 
-    /*
-     * The first mount is valid. The second mount deliberately fails.
-     * This ensures setup has already acquired a mount before entering
-     * the failure path.
-     */
     FILE *fp = fopen(config, "w");
 
     if (fp == NULL) {
@@ -1128,13 +1169,13 @@ static int test_configured_mount_failure_cleanup(void)
         return -1;
     }
 
-    /*
-     * The source directory belongs to the host namespace. If the
-     * configured mount leaked out of the container namespace, it
-     * would still be busy here and removal would fail.
-     */
     if (remove_tree(first_mount) != 0) {
         test_fail("configured mount remained after setup failure");
+        return -1;
+    }
+
+    if (runtime_dirs_unchanged(runtime_before) != 0) {
+        test_fail("runtime directory leaked after configured mount failure");
         return -1;
     }
 

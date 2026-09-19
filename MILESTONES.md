@@ -175,8 +175,8 @@ Make container setup and teardown robust against failures and hostile conditions
 * [x] Handle failure during `/dev` setup
 * [x] Handle failure during `/proc` setup
 * [x] Handle failure during configured mount setup
-* [ ] Verify cleanup after every setup failure
-* [ ] Verify no runtime-directory leaks
+* [x] Verify cleanup after every setup failure
+* [x] Verify no runtime-directory leaks
 * [ ] Verify no mount leaks
 * [ ] Verify no child-process leaks
 
@@ -195,7 +195,7 @@ Make container setup and teardown robust against failures and hostile conditions
 * [ ] Add hardening regression tests where appropriate
 * [ ] Add failure-path regression tests
 * [ ] Add teardown regression tests
-* [ ] Verify repeated container creation and teardown
+* [x] Verify repeated container creation and teardown
 * [ ] Verify abnormal child termination is cleaned up correctly
 
 ## Milestone 6 — Review & Release

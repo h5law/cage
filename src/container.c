@@ -1143,6 +1143,20 @@ static int run_command(struct child_context *ctx)
     return status;
 }
 
+static void close_overlay_work(struct child_context *ctx)
+{
+    if (ctx->work_fd == -1)
+        return;
+
+    if (cleanup_overlay_work(ctx->work_fd) == -1)
+        perror("cleanup overlay work");
+
+    if (close(ctx->work_fd) == -1)
+        perror("close overlay work");
+
+    ctx->work_fd = -1;
+}
+
 static int child_main(void *arg)
 {
     struct child_context *ctx = arg;
@@ -1223,9 +1237,7 @@ static int child_main(void *arg)
     if (prepare_mount_targets(ctx->container) == -1) {
         perror("prepare configured mount targets");
 
-        close(ctx->work_fd);
-        ctx->work_fd = -1;
-
+        close_overlay_work(ctx);
         cleanup_setup_mounts(ctx->container);
         return 1;
     }
@@ -1233,9 +1245,7 @@ static int child_main(void *arg)
     if (mount_configured_mounts(ctx->container) == -1) {
         perror("mount configured mounts");
 
-        close(ctx->work_fd);
-        ctx->work_fd = -1;
-
+        close_overlay_work(ctx);
         cleanup_setup_mounts(ctx->container);
         return 1;
     }
@@ -1250,8 +1260,7 @@ static int child_main(void *arg)
     if (pivot_root_to_overlay(ctx->container, &pivoted) == -1) {
         perror("pivot root");
 
-        close(ctx->work_fd);
-        ctx->work_fd = -1;
+        close_overlay_work(ctx);
 
         if (pivoted)
             cleanup_mounts();
@@ -1264,10 +1273,11 @@ static int child_main(void *arg)
     if (mount_tmpfs() == -1) {
         perror("mount tmpfs");
 
-        close(ctx->work_fd);
-        ctx->work_fd = -1;
+        close_overlay_work(ctx);
 
-        cleanup_mounts();
+        if (cleanup_mounts() == -1)
+            perror("cleanup mounts");
+
         return 1;
     }
 
@@ -1286,13 +1296,7 @@ static int child_main(void *arg)
     if (cleanup_mounts() == -1)
         perror("cleanup mounts");
 
-    if (ctx->work_fd != -1) {
-        if (cleanup_overlay_work(ctx->work_fd) == -1)
-            perror("cleanup overlay work");
-
-        close(ctx->work_fd);
-        ctx->work_fd = -1;
-    }
+    close_overlay_work(ctx);
 
     return status;
 }
